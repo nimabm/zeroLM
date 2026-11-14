@@ -77,7 +77,7 @@ The header is `{"program": <Program>, "tensors": [{"name", "rows", "cols"}, ...]
 | circuits pinned and reproducible | every spec in `model/prog/` compiles twice to the same SHA-256, equal to `model/prog/pinned.json` |
 | patch round trip | for every circuit: a one-value patch applies, a second apply is refused, and revert restores the original hash |
 | memory reference parity | 400 memory queries (taught keys and unknown keys) reproduced bit for bit from the exported bundle |
-| reasoning reference parity | every circuit run behind a generated world's questions, intact and with each operator ablated, replayed on the reference interpreter (970 runs, all bit-exact) |
+| reasoning reference parity | every circuit run while a generated world is taught and its questions answered, intact and with each operator ablated, replayed on the reference interpreter (1,343 runs, all bit-exact) |
 | host audit | the model-path files listed in `model/prog/host-audit.json` contain no text processing; host code that still makes content decisions is listed as **pending** |
 
 The gate passes when every check holds. The milestone counts as complete only when the pending list is also empty, which means all model behavior is in weights.
@@ -92,6 +92,25 @@ The gate passes when every check holds. The milestone counts as complete only wh
 4. Bind the three: $a = u_1 \otimes u_2 \otimes u_3$ (elementwise complex product).
 
 Two different names collide only if all three hashes collide (probability about $1024^{-3}$), and the phases of unrelated names are independent, so their cosine is about 0 with standard deviation $1/\sqrt{2d}$. The host copies bytes and memoizes the circuit's output by the same key; it inspects no byte.
+
+## The number circuits
+
+`model/prog/number-encode.json` and `model/prog/number-decode.json`, compiled by `zerolm_wsp::circuits::number`. They replace the host's fractional-power number encoder and its cleanup scan. Numbers are $\mathrm{num}(n)_k = e^{i n \phi_k}$ with a seeded base $\phi$, and two seeded tables are initialized from it (bound model tensors, verified on load): the digit table $D$ (`core.reasoner.number_digits`, 70 rows, row $10q + v = \mathrm{num}(v\,10^q)$) and the codebook $C$ (`core.reasoner.number_codebook`, 2,001 rows, row $j = \mathrm{num}(j - 1000)$).
+
+**`number-encode`.** Input: a row of $L = 8$ byte values holding the decimal numeral (optional leading `-`) at positions $0..\ell$. Because $\mathrm{num}$ is a homomorphism from addition to binding, $\mathrm{num}(\sum_q v_q 10^q) = \circledast_q\, \mathrm{num}(v_q 10^q)$:
+
+1. `classify`: compare each byte with the codes 48..57 (`ge` both ways, `mul`): a digit one-hot $O \in \{0,1\}^{L \times 10}$ and the digit indicator $s = O\mathbf{1}$.
+2. `position`: the place of byte $j$ is the number of digits after it, $p = s^\top U$ with $U_{ij} = [i > j]$; compared with the places $0..6$ it gives a one-hot $P \in \{0,1\}^{L \times 7}$.
+3. `select`: $S = (P\,\mathrm{Spread}) \odot (O\,\mathrm{Tile})$ has a single 1 at column $10q + v$ in each digit row, so $SD$ holds $\mathrm{num}(v_j 10^{q_j})$ per digit byte.
+4. `fill`: non-digit bytes (padding, the sign) get the identity phasor $\mathrm{num}(0)$: add $(1 - s)\,e$ with $e = [1, \dots, 1, 0, \dots, 0]$.
+5. `product`: bind the $L$ rows.
+6. `sign`: if byte 0 equals 45, negate the imaginary half (conjugation, $\mathrm{num}(-n) = \overline{\mathrm{num}(n)}$).
+
+A digit beyond the seventh place selects no row, which zeroes the output; the parser only produces integers up to $10^6$. The output equals the host formula up to `f32` rounding of the products (similarity $1 \pm 10^{-4}$, unit test).
+
+**`number-decode`.** Input: a vector $v$ (1 x $2d$). `matvec` scores $Cv$, `topk` keeps the best row (ties to the lower index), and the mask reads out the integer (a constant column $-1000..1000$, exact in `f32`) and the clean row of $C$. The arithmetic operator binds clean rows and decodes again, so a sum is exactly `decode(num(a) * num(b))`.
+
+Ablation (unit test): zeroing `sign` zeroes every output; zeroing `position` makes each digit select all of its places (cosine with the true vector about 1/7); zeroing `readout` reads every number as 0.
 
 ## Why the zero-skip is exact
 

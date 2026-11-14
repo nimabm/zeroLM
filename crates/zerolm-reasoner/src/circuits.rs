@@ -9,9 +9,10 @@
 
 use crate::{field, Reasoner, ReasonerConfig, ROLES};
 use std::collections::BTreeMap;
-use zerolm_engine::binding::Hv;
+use zerolm_engine::binding::{Hv, Space};
 use zerolm_engine::isa::{self, bundle, Bindings, Buf, Outputs, View};
 use zerolm_wsp::circuits::atom_encode::Params as AtomParams;
+use zerolm_wsp::circuits::number::{DecodeParams as NumberDecodeParams, EncodeParams as NumberEncodeParams};
 use zerolm_wsp::circuits::relational::{Params, OPERATORS};
 use zerolm_wsp::{compile, Circuit, Compiled, Spec};
 
@@ -118,6 +119,113 @@ impl Atoms {
     }
 }
 
+pub const NUMBER_ENCODE_ID: &str = "number-encode";
+pub const NUMBER_DECODE_ID: &str = "number-decode";
+/// Encoder width: a sign and up to 7 digits (the parser accepts 0..=1,000,000).
+pub const NUMBER_BYTES: usize = 8;
+/// Decimal places of `core.reasoner.number_digits`.
+pub const NUMBER_PLACES: usize = 7;
+
+pub fn number_encode_spec(cfg: &ReasonerConfig) -> Spec {
+    Spec {
+        id: NUMBER_ENCODE_ID.into(),
+        version: 1,
+        seed_entry: "number-encode-circuit".into(),
+        description: String::new(),
+        circuit: Circuit::NumberEncode(NumberEncodeParams { numeral_bytes: NUMBER_BYTES, places: NUMBER_PLACES, dim: cfg.dim }),
+    }
+}
+
+pub fn number_decode_spec(cfg: &ReasonerConfig) -> Spec {
+    Spec {
+        id: NUMBER_DECODE_ID.into(),
+        version: 1,
+        seed_entry: "number-decode-circuit".into(),
+        description: String::new(),
+        circuit: Circuit::NumberDecode(NumberDecodeParams { range: cfg.number_range as u32, dim: cfg.dim }),
+    }
+}
+
+/// A number decoded by `number-decode`: its value and the clean codebook row.
+#[derive(Debug, Clone)]
+pub struct Decoded {
+    pub value: i64,
+    pub clean: Hv,
+}
+
+/// The compiled number encoder and decoder with their seeded tables
+/// (`core.reasoner.number_digits`, `core.reasoner.number_codebook`).
+pub struct Numbers {
+    pub encoder: Compiled,
+    pub decoder: Compiled,
+    pub digits: zerolm_tensor::Matrix,
+    pub codebook: zerolm_tensor::Matrix,
+    cache: std::cell::RefCell<std::collections::HashMap<i64, Hv>>,
+    recorder: std::cell::RefCell<Option<Vec<Recorded>>>,
+    dim: usize,
+}
+
+impl Numbers {
+    pub fn new(cfg: &ReasonerConfig) -> Self {
+        let space = Space::new(cfg.seed, cfg.dim);
+        let d2 = 2 * cfg.dim;
+        let rows = (2 * cfg.number_range + 1) as usize;
+        Numbers {
+            encoder: compile(&number_encode_spec(cfg)).expect("valid reasoning config compiles"),
+            decoder: compile(&number_decode_spec(cfg)).expect("valid reasoning config compiles"),
+            digits: zerolm_tensor::Matrix { rows: 10 * NUMBER_PLACES, cols: d2, data: space.digit_table(NUMBER_PLACES) },
+            codebook: zerolm_tensor::Matrix { rows, cols: d2, data: space.codebook(cfg.number_range) },
+            cache: Default::default(),
+            recorder: Default::default(),
+            dim: cfg.dim,
+        }
+    }
+
+    fn run(&self, c: &Compiled, input: (&str, Buf), table: (&str, View<'_>)) -> Outputs {
+        let mut w: Vec<(&str, View<'_>)> = vec![table];
+        w.extend(c.tensors.iter().map(|t| (t.name.as_str(), t.view())));
+        let mut b = Bindings::new().input(input.0, input.1.clone());
+        for (n, v) in &w {
+            b = b.weight(n, *v);
+        }
+        let out = isa::run(&c.program, b).unwrap_or_else(|e| panic!("{} runs: {e}", c.id));
+        if let Some(rec) = self.recorder.borrow_mut().as_mut() {
+            rec.push(Recorded { program: c.id.clone(), bundle: bundle::encode(&c.program, &w), inputs: vec![(input.0.to_string(), input.1)], outputs: out.clone() });
+        }
+        out
+    }
+
+    /// The phasor of an integer from its decimal numeral bytes, computed by
+    /// `number-encode` (memoized by the integer).
+    pub fn encode(&self, n: i64) -> Hv {
+        if let Some(h) = self.cache.borrow().get(&n) {
+            return h.clone();
+        }
+        // The parser hands over an integer; its canonical decimal numeral is
+        // the circuit input (bytes copied, none inspected).
+        let numeral = n.to_string();
+        assert!(numeral.len() <= NUMBER_BYTES, "numeral wider than the number-encode input");
+        let mut row = vec![0.0f32; NUMBER_BYTES];
+        for (slot, b) in row.iter_mut().zip(numeral.bytes()) {
+            *slot = b as f32;
+        }
+        let out = self.run(&self.encoder, ("numeral", Buf::row(row)), ("digits", self.digits_view()));
+        let h = Hv::from_data(self.dim, &out.get("number").data);
+        self.cache.borrow_mut().insert(n, h.clone());
+        h
+    }
+
+    /// Clean up a noisy number vector with `number-decode`.
+    pub fn decode(&self, v: &Hv) -> Decoded {
+        let out = self.run(&self.decoder, ("v", Buf::row(v.data.clone())), ("numbers", view(&self.codebook, self.codebook.rows)));
+        Decoded { value: out.get("value").data[0] as i64, clean: Hv::from_data(self.dim, &out.get("clean").data) }
+    }
+
+    fn digits_view(&self) -> View<'_> {
+        view(&self.digits, self.digits.rows)
+    }
+}
+
 pub struct Circuits {
     pub graph: Compiled,
     pub reach: Compiled,
@@ -168,12 +276,14 @@ impl Reasoner {
     pub fn record_circuits(&self, on: bool) {
         *self.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
         *self.atoms.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
+        *self.numbers.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
     }
 
     /// Take the runs recorded so far.
     pub fn take_recorded(&self) -> Vec<Recorded> {
         let mut runs = self.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default();
         runs.extend(self.atoms.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default());
+        runs.extend(self.numbers.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default());
         runs
     }
 
@@ -300,5 +410,48 @@ mod tests {
         let again = Atoms::new(&cfg).encode("sym", "cat");
         assert_eq!(again.data, vs[0].data);
         assert!(cosine(&a.encode("role", "cat"), &vs[0]).abs() < 0.15, "namespaces differ");
+    }
+
+    #[test]
+    fn number_circuits_encode_numerals_and_decode_by_cleanup() {
+        let cfg = ReasonerConfig::default();
+        let nums = Numbers::new(&cfg);
+        let space = Space::new(cfg.seed, cfg.dim);
+        for n in [0, 1, 7, 10, 42, 100, 907, 1000, -1, -2, -58, -1000, 123_456, 1_000_000, -999_999] {
+            let v = nums.encode(n);
+            assert!((sim(&v, &space.number(n)) - 1.0).abs() < 1e-4, "{n}: {}", sim(&v, &space.number(n)));
+            if n.abs() <= cfg.number_range {
+                let d = nums.decode(&v);
+                assert_eq!(d.value, n);
+                assert_eq!(d.clean.data, space.number(n).data, "clean row is the codebook row");
+            }
+        }
+        // Addition is binding: 38 + (-45) = -7, decoded from clean vectors.
+        let (a, b) = (nums.decode(&nums.encode(38)), nums.decode(&nums.encode(-45)));
+        assert_eq!(nums.decode(&zerolm_engine::binding::bind(&a.clean, &b.clean)).value, -7);
+        // A noisy superposition still decodes to its dominant number.
+        let mut noisy = nums.encode(321);
+        noisy.add_assign(&Atoms::new(&cfg).encode("sym", "noise"));
+        assert_eq!(nums.decode(&noisy).value, 321);
+    }
+
+    #[test]
+    fn number_circuit_blocks_carry_what_they_claim() {
+        let cfg = ReasonerConfig::default();
+        let space = Space::new(cfg.seed, cfg.dim);
+        let mut nums = Numbers::new(&cfg);
+        nums.encoder.ablate_block("sign").unwrap();
+        // Without the sign block, the output is zeroed (the sign mask is 0).
+        assert!(nums.encode(-12).is_zero());
+        let mut nums = Numbers::new(&cfg);
+        nums.encoder.ablate_block("position").unwrap();
+        // Without places every digit selects all 7 of its rows: a 49-term
+        // superposition in which number(12) is one term (cosine about 1/7).
+        assert!(cosine(&nums.encode(12), &space.number(12)) < 0.5);
+        let mut nums = Numbers::new(&cfg);
+        nums.decoder.ablate_block("readout").unwrap();
+        assert_eq!(nums.decode(&space.number(12)).value, 0, "no values to read out");
+        let nums = Numbers::new(&cfg);
+        assert!((sim(&nums.encode(-12), &space.number(-12)) - 1.0).abs() < 1e-4);
     }
 }

@@ -20,7 +20,7 @@ pub mod oracle;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use zerolm_engine::binding::{bind, bundle, sim_raw, unbind, Hv, Space};
+use zerolm_engine::binding::{bind, bundle, sim_raw, unbind, Hv};
 use zerolm_engine::semantic_state::{parse, Fact, Pred, Rule, SemanticState, Term, Utterance};
 use zerolm_memory::checkpoint::{self, CheckpointError, Tensor};
 use zerolm_tensor::sha256::Sha256;
@@ -32,7 +32,8 @@ pub const CODEBOOK: &str = "memory.relations.codebook";
 pub const STATE: &str = "memory.relations.state";
 pub const ROLES_T: &str = "core.reasoner.roles";
 pub const RELATIONS_T: &str = "core.reasoner.relations";
-pub const NUMBER_T: &str = "core.reasoner.number_one";
+pub const NUMBER_DIGITS_T: &str = "core.reasoner.number_digits";
+pub const NUMBER_CODEBOOK_T: &str = "core.reasoner.number_codebook";
 pub const ATOM_TABLE_T: &str = "core.reasoner.atom_table";
 
 pub const ROLES: [&str; 5] = ["subj", "rel", "obj", "quant", "scope"];
@@ -271,7 +272,7 @@ pub struct WriteEvent {
 pub struct Reasoner {
     pub cfg: ReasonerConfig,
     pub ops: Ops,
-    space: Space,
+    numbers: circuits::Numbers,
     /// Compiled atom encoder (`atom-encode`) with its table.
     atoms: circuits::Atoms,
     roles: Vec<Hv>,
@@ -310,7 +311,6 @@ const P24: u64 = 1 << 24;
 impl Reasoner {
     pub fn new(cfg: ReasonerConfig) -> Result<Self, ReasonerError> {
         cfg.validate().map_err(ReasonerError::Config)?;
-        let space = Space::new(cfg.seed, cfg.dim);
         let atoms = circuits::Atoms::new(&cfg);
         let roles = ROLES.iter().map(|r| atoms.encode("role", r)).collect();
         let rels = RELATIONS.iter().map(|r| atoms.encode("rel", r)).collect();
@@ -333,7 +333,7 @@ impl Reasoner {
             graph_cache: std::cell::RefCell::new(None),
             recorder: std::cell::RefCell::new(None),
             atoms,
-            space,
+            numbers: circuits::Numbers::new(&cfg),
             cfg,
         })
     }
@@ -354,8 +354,9 @@ impl Reasoner {
         self.atoms.encode("sym", name)
     }
 
-    pub fn space(&self) -> &Space {
-        &self.space
+    /// The compiled number encoder and decoder.
+    pub fn numbers(&self) -> &circuits::Numbers {
+        &self.numbers
     }
 
     pub fn events(&self) -> &[WriteEvent] {
@@ -477,9 +478,9 @@ impl Reasoner {
             Pred::Prop(x) => p.extend([(REL, self.rel("prop").clone()), (OBJ, sym(x))]),
             Pred::Greater { dim, other } => p.extend([(REL, bind(self.rel("gt"), &sym(dim))), (OBJ, sym(other))]),
             Pred::Before(y) => p.extend([(REL, self.rel("before").clone()), (OBJ, sym(y))]),
-            Pred::Count { thing, n } => p.extend([(REL, bind(self.rel("has"), &sym(thing))), (QUANT, self.space.number(*n))]),
+            Pred::Count { thing, n } => p.extend([(REL, bind(self.rel("has"), &sym(thing))), (QUANT, self.numbers.encode(*n))]),
             Pred::More { thing, delta, other } => {
-                p.extend([(REL, bind(self.rel("more"), &sym(thing))), (OBJ, sym(other)), (QUANT, self.space.number(*delta))])
+                p.extend([(REL, bind(self.rel("more"), &sym(thing))), (OBJ, sym(other)), (QUANT, self.numbers.encode(*delta))])
             }
         }
         p
@@ -612,7 +613,8 @@ impl Reasoner {
         let mut t = vec![
             Tensor::new(ROLES_T, "binding_roles", ROLES.len(), d2, rows(&fresh.roles)),
             Tensor::new(RELATIONS_T, "binding_roles", RELATIONS.len(), d2, rows(&fresh.rels)),
-            Tensor::new(NUMBER_T, "binding_roles", 1, d2, self.space.number(1).data),
+            Tensor::new(NUMBER_DIGITS_T, "binding_roles", fresh.numbers.digits.rows, d2, fresh.numbers.digits.data.clone()),
+            Tensor::new(NUMBER_CODEBOOK_T, "binding_roles", fresh.numbers.codebook.rows, d2, fresh.numbers.codebook.data.clone()),
             Tensor::new(ATOM_TABLE_T, "binding_roles", self.atoms.table.rows, d2, self.atoms.table.data.clone()),
             Tensor::new(SLOTS, "relation_memory", self.slots.rows, d2, self.slots.data.clone()),
             Tensor::new(META, "relation_memory", self.meta.rows, field::COUNT, self.meta.data.clone()),
@@ -626,7 +628,7 @@ impl Reasoner {
             ),
         ];
         // Compiled circuit constants (W_PROG), frozen like the role phasors.
-        for c in [&fresh.atoms.circuit, &fresh.circuits.graph, &fresh.circuits.reach] {
+        for c in [&fresh.atoms.circuit, &fresh.numbers.encoder, &fresh.numbers.decoder, &fresh.circuits.graph, &fresh.circuits.reach] {
             for p in &c.tensors {
                 t.push(Tensor::new(&c.qualified(&p.name), zerolm_wsp::compiler::GROUP, p.rows, p.cols, p.data.clone()));
             }
@@ -658,7 +660,7 @@ impl Reasoner {
                 return Err(ReasonerError::Format(format!("unexpected tensor {}", got.name)));
             }
             match got.name.as_str() {
-                name if name == ROLES_T || name == RELATIONS_T || name == NUMBER_T || name == ATOM_TABLE_T || name.starts_with("prog.") => {
+                name if name == ROLES_T || name == RELATIONS_T || name == NUMBER_DIGITS_T || name == NUMBER_CODEBOOK_T || name == ATOM_TABLE_T || name.starts_with("prog.") => {
                     if got.data.iter().zip(&w.data).any(|(a, b)| a.to_bits() != b.to_bits()) {
                         return Err(ReasonerError::CoreMismatch(got.name));
                     }

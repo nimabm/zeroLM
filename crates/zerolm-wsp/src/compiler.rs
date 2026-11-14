@@ -33,6 +33,8 @@ pub enum Circuit {
     AtomEncode(circuits::atom_encode::Params),
     AttentionRead(circuits::attention_read::Params),
     KeyEncode(circuits::key_encode::Params),
+    NumberEncode(circuits::number::EncodeParams),
+    NumberDecode(circuits::number::DecodeParams),
     RelationGraph(circuits::relational::Params),
     RelationReach(circuits::relational::Params),
 }
@@ -119,6 +121,8 @@ pub fn compile(spec: &Spec) -> Result<Compiled, IsaError> {
         Circuit::AtomEncode(p) => circuits::atom_encode::compile(&spec.id, p)?,
         Circuit::AttentionRead(p) => circuits::attention_read::compile(&spec.id, p)?,
         Circuit::KeyEncode(p) => circuits::key_encode::compile(&spec.id, p)?,
+        Circuit::NumberEncode(p) => circuits::number::compile_encode(&spec.id, p)?,
+        Circuit::NumberDecode(p) => circuits::number::compile_decode(&spec.id, p)?,
         Circuit::RelationGraph(p) => circuits::relational::compile_graph(&spec.id, p)?,
         Circuit::RelationReach(p) => circuits::relational::compile_reach(&spec.id, p)?,
     };

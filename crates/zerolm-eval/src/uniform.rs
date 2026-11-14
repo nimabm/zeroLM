@@ -137,18 +137,19 @@ fn memory_parity() -> Result<Parity, String> {
     Ok(p)
 }
 
-/// Reasoning: answer a generated world's questions (intact, then with each
-/// operator ablated in turn on a subset), record every circuit run, and
+/// Reasoning: teach a generated world, answer its questions (intact, then
+/// with each operator ablated in turn on a subset), record every circuit run, and
 /// replay all of them on the reference interpreter in parallel.
 fn reasoning_parity(root: &Path) -> Result<Parity, String> {
     let spec = reasoning::Spec::load(root)?;
     let seed = *spec.main_seeds.first().ok_or("no main seed")?;
     let world = reasoning::generate(&spec, seed);
     let mut r = Reasoner::new(spec.config).map_err(|e| e.to_string())?;
+    // Record from the first statement, so encoder runs while teaching are replayed too.
+    r.record_circuits(true);
     for s in &world.statements {
         r.observe(&s.text, "uniform:synthetic-world").map_err(|e| e.to_string())?;
     }
-    r.record_circuits(true);
     for q in &world.questions {
         r.ask(&q.text);
     }

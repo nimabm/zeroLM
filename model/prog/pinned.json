@@ -4,6 +4,8 @@
     "atom-encode": "94a9df214e0da88cbb3b3a59bebe001073ec75fd133e4c36a9ec57ac033ded0e",
     "memory-encode": "99b405aa6bd6a3beaf5f8e87f425a24721e0817f18807408f6ffaae5a8207feb",
     "memory-read": "05a51725faae1cf9282815f82417a3976b5034937bdf7f7ee8449104659d475d",
+    "number-decode": "faf56ddfb8f262aa26784a5da5b9fd40f90f46afbd2202d7e9082dc53ce00aee",
+    "number-encode": "bb850fbef9db6f31b63f71ae16e304842f6d2d30ab4aa0348d1d37842ac78c0d",
     "relation-graph": "efefcd319d2f39c8366a3491c1505cbfa8e05287be3293a57fca586ad668bb51",
     "relation-reach": "7f6ed8d82ffc0d10f9a63bb897b874d53c54eec33960a4c68122449a1438c6ee"
   }

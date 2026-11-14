@@ -6,6 +6,7 @@
 //! next, the depth limit, how polarities combine) is programmed and documented
 //! here; nothing is learned. Derived answers are never written back to memory.
 
+use crate::circuits::Decoded;
 use crate::{field, Answer, Reasoner, Verdict, OBJ, QUANT, REL, SCOPE, SUBJ};
 use std::collections::{BTreeMap, BTreeSet};
 use zerolm_engine::binding::{bind, cosine, Hv};
@@ -251,26 +252,25 @@ impl Reasoner {
         None
     }
 
-    /// Every count of `thing` derivable for `x`, with its proof.
-    fn counts(&self, x: usize, thing: &str, depth: usize, visited: &mut BTreeSet<usize>) -> Vec<(i64, Proof)> {
+    /// Every count of `thing` derivable for `x` (decoded by the compiled
+    /// `number-decode` circuit, with its clean vector), with its proof.
+    fn counts(&self, x: usize, thing: &str, depth: usize, visited: &mut BTreeSet<usize>) -> Vec<(Decoded, Proof)> {
         let sym = self.symbol(thing);
-        let r = self.cfg.number_range;
-        let mut out: Vec<(i64, Proof)> = self
+        let mut out: Vec<(Decoded, Proof)> = self
             .matches(&[(SUBJ, self.code(x)), (REL, bind(self.rel("has"), &sym))])
             .into_iter()
             .filter(|&s| self.slot_meta(s, field::POLARITY) == 1.0)
-            .map(|s| (self.space().decode_number(&self.unbind_slot(s, QUANT), -r..=r).0, Proof::of(vec![s], "direct")))
+            .map(|s| (self.numbers().decode(&self.unbind_slot(s, QUANT)), Proof::of(vec![s], "direct")))
             .collect();
         if !self.ops.arithmetic || depth >= self.cfg.max_depth || !visited.insert(x) {
             return out;
         }
         for s in self.matches(&[(SUBJ, self.code(x)), (REL, bind(self.rel("more"), &sym))]) {
             let Some(other) = self.cleanup(&self.unbind_slot(s, OBJ)) else { continue };
-            let delta = self.space().decode_number(&self.unbind_slot(s, QUANT), -r..=r).0;
+            let delta = self.numbers().decode(&self.unbind_slot(s, QUANT));
             for (c, p) in self.counts(other, thing, depth + 1, visited) {
-                // Addition is binding of fractional-power number vectors.
-                let sum = bind(&self.space().number(c), &self.space().number(delta));
-                let (n, _) = self.space().decode_number(&sum, -r..=r);
+                // Addition is binding of clean fractional-power number vectors.
+                let n = self.numbers().decode(&bind(&c.clean, &delta.clean));
                 out.push((n, Proof::of(vec![s], "arithmetic").join(p)));
             }
         }
@@ -280,7 +280,7 @@ impl Reasoner {
 
     fn count_answer(&self, x: usize, thing: &str) -> Answer {
         let all = self.counts(x, thing, 0, &mut BTreeSet::new());
-        let values: BTreeSet<i64> = all.iter().map(|(n, _)| *n).collect();
+        let values: BTreeSet<i64> = all.iter().map(|(n, _)| n.value).collect();
         match values.len() {
             0 => self.unknown(),
             1 => {

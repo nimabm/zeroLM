@@ -21,7 +21,7 @@ Every symbol, role, and relation is a 512-dimensional vector of complex unit pha
 - **Unbind:** product with the conjugate.
 - **Bundle:** sum.
 
-Numbers use fractional-power encoding, `number(n)_k = exp(i n θ_k)`, so `bind(number(a), number(b)) = number(a+b)`. The arithmetic operator adds by binding number vectors and then cleans the result up to an integer.
+Numbers use fractional-power encoding, `number(n)_k = exp(i n θ_k)`, so `bind(number(a), number(b)) = number(a+b)`. The arithmetic operator adds by binding number vectors and then cleans the result up to an integer. Both directions run as compiled circuits (`docs/neural-isa.md`): `number-encode` turns the bytes of a decimal numeral into `number(n)` as a product of seeded digit phasors, and `number-decode` cleans a vector up against a seeded codebook.
 
 ### Language (`crates/zerolm-engine/src/semantic_state.rs`)
 
@@ -44,7 +44,7 @@ The discourse state updates as `c ← 0.5 c + subject` after each statement. "it
 | `memory.relations.slots` | `relation_memory` | 4096 x 1024: bound bundle per fact/rule, e.g. `subj(*)rex + rel(*)isa + obj(*)dog` |
 | `memory.relations.meta` | `relation_memory` | polarity (+1 / -1), confidence, kind, logical time, provenance hash |
 | `memory.relations.codebook` | `relation_memory` | symbol vectors seen so far (no names are stored) |
-| `core.reasoner.*` | `binding_roles` | frozen role / relation phasors and the number base, verified on load |
+| `core.reasoner.*` | `binding_roles` | frozen atom hash table, role / relation phasors, and the number digit table and cleanup codebook, verified on load |
 
 The checkpoint uses the memory component's atomic format (`docs/memory-format.md`). Questions and derived answers are never written to memory.
 
@@ -116,7 +116,7 @@ With a seeded base $\phi_k \sim \mathcal{U}(-\pi, \pi)$:
 
 $$\mathrm{num}(n)_k = e^{i n \phi_k}, \qquad \mathrm{num}(a) \circledast \mathrm{num}(b) = \mathrm{num}(a + b), \qquad \mathrm{num}(a) \oslash \mathrm{num}(b) = \mathrm{num}(a - b)$$
 
-So addition **is** binding. For integers $a \ne b$, $\mathbb{E}\cos((a-b)\phi_k) = 0$ over the uniform base, so distinct integers are quasi-orthogonal (sd 0.031). Decoding picks $\hat n = \arg\max_{|n| \le 1000} \mathrm{sim}(v, \mathrm{num}(n))$. The scan never calls trigonometric functions per candidate: it steps a phasor, $\mathrm{num}(n+1) = \mathrm{num}(n) \circledast \mathrm{num}(1)$, in `f64`. Among 2,001 candidates the largest spurious similarity is about 0.12 against 1 for the true value.
+So addition **is** binding. For integers $a \ne b$, $\mathbb{E}\cos((a-b)\phi_k) = 0$ over the uniform base, so distinct integers are quasi-orthogonal (sd 0.031). Decoding picks $\hat n = \arg\max_{|n| \le 1000} \mathrm{sim}(v, \mathrm{num}(n))$: the `number-decode` circuit scores $v$ against the codebook rows $\mathrm{num}(-1000), \dots, \mathrm{num}(1000)$ (one `matvec`), keeps the top one, and reads out its integer and its clean row. Encoding needs no trigonometry at run time: since $\mathrm{num}$ is a homomorphism, $\mathrm{num}(\sum_q v_q 10^q) = \circledast_q\, \mathrm{num}(v_q 10^q)$, so the `number-encode` circuit selects one row of the digit table per digit and binds them. Among 2,001 candidates the largest spurious similarity is about 0.12 against 1 for the true value.
 
 ### Discourse state ("it")
 

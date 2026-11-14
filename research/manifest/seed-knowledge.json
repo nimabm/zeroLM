@@ -40,7 +40,7 @@
     {
       "id": "phasor-binding-init",
       "kind": "init_formula",
-      "description": "Symbols, roles, and relation atoms are unit complex phasors computed by the compiled atom-encode circuit from their namespaced name bytes and the seeded table core.reasoner.atom_table (random rows from a SplitMix64 stream); numbers use fractional-power encoding exp(i n theta) with a seeded base. Binding is elementwise complex multiplication.",
+      "description": "Symbols, roles, and relation atoms are unit complex phasors computed by the compiled atom-encode circuit from their namespaced name bytes and the seeded table core.reasoner.atom_table (random rows from a SplitMix64 stream); numbers use fractional-power encoding exp(i n theta) with a seeded base theta, from which two tables are initialized: core.reasoner.number_digits (row 10 q + v = number(v 10^q), q < 7) and core.reasoner.number_codebook (row j = number(j - number_range)); encoding and cleanup run in the compiled number-encode and number-decode circuits. Binding is elementwise complex multiplication.",
       "source": "crates/zerolm-engine/src/binding.rs",
       "derived_from_corpus": false
     },
@@ -77,6 +77,20 @@
       "kind": "structural_prior",
       "description": "Circuit atom-encode (model/prog/atom-encode.json): the vector-symbolic atom encoder as a neural ISA program, the bytes of a namespaced name to a unit complex phasor vector. Constants: three salt bytes (1, 2, 3), a broadcast column of ones, one-hot row selectors, and norm epsilon 0. Hashed rows come from core.reasoner.atom_table (seeded random). No vocabulary or facts.",
       "source": "crates/zerolm-wsp/src/circuits/atom_encode.rs",
+      "derived_from_corpus": false
+    },
+    {
+      "id": "number-encode-circuit",
+      "kind": "structural_prior",
+      "description": "Circuit number-encode (model/prog/number-encode.json): a decimal numeral (bytes, optional leading minus) to its fractional-power phasor as a neural ISA program. Constants: the ten digit byte codes 48..57, the minus byte 45, a strict lower-triangular place counter, place indices 0..6, one-hot spread and tile selectors, the identity phasor, row pickers, and the conjugation mask. Digit rows come from core.reasoner.number_digits (seeded). Positional decimal notation is the only prior; no vocabulary or facts.",
+      "source": "crates/zerolm-wsp/src/circuits/number.rs",
+      "derived_from_corpus": false
+    },
+    {
+      "id": "number-decode-circuit",
+      "kind": "structural_prior",
+      "description": "Circuit number-decode (model/prog/number-decode.json): cleanup of a noisy number phasor as a neural ISA program: scores against core.reasoner.number_codebook, top-1, and readout of the integer value (constant column -range..range) and the clean codebook row. No vocabulary or facts.",
+      "source": "crates/zerolm-wsp/src/circuits/number.rs",
       "derived_from_corpus": false
     },
     {

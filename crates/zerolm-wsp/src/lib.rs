@@ -12,12 +12,14 @@ pub mod patch;
 pub use compiler::{compile, parse_spec, Circuit, Compiled, ProgTensor, Spec};
 
 /// Pinned circuit specifications shipped with the model, as (file name, JSON).
-pub const SPECS: [(&str, &str); 5] = [
+pub const SPECS: [(&str, &str); 7] = [
     ("memory-read.json", include_str!("../../../model/prog/memory-read.json")),
     ("memory-encode.json", include_str!("../../../model/prog/memory-encode.json")),
     ("relation-graph.json", include_str!("../../../model/prog/relation-graph.json")),
     ("atom-encode.json", include_str!("../../../model/prog/atom-encode.json")),
     ("relation-reach.json", include_str!("../../../model/prog/relation-reach.json")),
+    ("number-encode.json", include_str!("../../../model/prog/number-encode.json")),
+    ("number-decode.json", include_str!("../../../model/prog/number-decode.json")),
 ];
 
 /// `model/prog/pinned.json`: circuit id -> SHA-256 of the compiled output.
