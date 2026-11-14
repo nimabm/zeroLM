@@ -33,6 +33,7 @@ pub const STATE: &str = "memory.relations.state";
 pub const ROLES_T: &str = "core.reasoner.roles";
 pub const RELATIONS_T: &str = "core.reasoner.relations";
 pub const NUMBER_T: &str = "core.reasoner.number_one";
+pub const ATOM_TABLE_T: &str = "core.reasoner.atom_table";
 
 pub const ROLES: [&str; 5] = ["subj", "rel", "obj", "quant", "scope"];
 pub const RELATIONS: [&str; 10] = ["isa", "can", "in", "prop", "gt", "before", "has", "more", "implies", "something"];
@@ -271,6 +272,8 @@ pub struct Reasoner {
     pub cfg: ReasonerConfig,
     pub ops: Ops,
     space: Space,
+    /// Compiled atom encoder (`atom-encode`) with its table.
+    atoms: circuits::Atoms,
     roles: Vec<Hv>,
     rels: Vec<Hv>,
     slots: Matrix,
@@ -308,8 +311,9 @@ impl Reasoner {
     pub fn new(cfg: ReasonerConfig) -> Result<Self, ReasonerError> {
         cfg.validate().map_err(ReasonerError::Config)?;
         let space = Space::new(cfg.seed, cfg.dim);
-        let roles = ROLES.iter().map(|r| space.role(r)).collect();
-        let rels = RELATIONS.iter().map(|r| space.atom("rel", r)).collect();
+        let atoms = circuits::Atoms::new(&cfg);
+        let roles = ROLES.iter().map(|r| atoms.encode("role", r)).collect();
+        let rels = RELATIONS.iter().map(|r| atoms.encode("rel", r)).collect();
         Ok(Reasoner {
             ops: Ops::ALL,
             roles,
@@ -328,6 +332,7 @@ impl Reasoner {
             circuits: circuits::Circuits::new(&cfg),
             graph_cache: std::cell::RefCell::new(None),
             recorder: std::cell::RefCell::new(None),
+            atoms,
             space,
             cfg,
         })
@@ -342,6 +347,11 @@ impl Reasoner {
             }
             Pathway::Retrieval => self.retrieval_ablated = true,
         }
+    }
+
+    /// The vector of a name, computed by the compiled atom encoder.
+    pub fn symbol(&self, name: &str) -> Hv {
+        self.atoms.encode("sym", name)
     }
 
     pub fn space(&self) -> &Space {
@@ -417,11 +427,11 @@ impl Reasoner {
 
     /// Index of a name's symbol if it was ever stored.
     pub fn known(&self, name: &str) -> Option<usize> {
-        self.find_symbol(&self.space.symbol(name))
+        self.find_symbol(&self.symbol(name))
     }
 
     fn intern(&mut self, name: &str) -> Result<usize, ReasonerError> {
-        let v = self.space.symbol(name);
+        let v = self.symbol(name);
         if let Some(i) = self.find_symbol(&v) {
             return Ok(i);
         }
@@ -458,7 +468,7 @@ impl Reasoner {
 
     /// Relation vector and role-filler parts of a predicate for subject `s`.
     pub(crate) fn pred_parts(&self, s: &Hv, pred: &Pred) -> Vec<(usize, Hv)> {
-        let sym = |n: &str| self.space.symbol(n);
+        let sym = |n: &str| self.symbol(n);
         let mut p = vec![(SUBJ, s.clone())];
         match pred {
             Pred::Isa(c) => p.extend([(REL, self.rel("isa").clone()), (OBJ, sym(c))]),
@@ -487,7 +497,7 @@ impl Reasoner {
     /// Resolve a subject term to a codebook vector; `None` if "it" is unresolved.
     pub(crate) fn resolve(&self, t: &Term) -> Option<(Hv, bool)> {
         match t {
-            Term::Name(n) => Some((self.space.symbol(n), false)),
+            Term::Name(n) => Some((self.symbol(n), false)),
             Term::Pronoun => {
                 let cands: Vec<Hv> = (0..self.n_sym).map(|i| self.code(i)).collect();
                 self.state.resolve(cands.iter().enumerate(), self.cfg.pronoun_min).map(|(i, _)| (cands[i].clone(), true))
@@ -563,13 +573,13 @@ impl Reasoner {
             self.intern(n)?;
         }
         let scope = match &r.scope {
-            Some(x) => self.space.symbol(x),
+            Some(x) => self.symbol(x),
             None => self.rel("something").clone(),
         };
         let parts = vec![
-            (SUBJ, self.space.symbol(&r.premise)),
+            (SUBJ, self.symbol(&r.premise)),
             (REL, self.rel("implies").clone()),
-            (OBJ, self.space.symbol(&r.conclusion)),
+            (OBJ, self.symbol(&r.conclusion)),
             (SCOPE, scope),
         ];
         self.write(&parts, 1.0, RULE_KIND, 1.0, stream)
@@ -603,6 +613,7 @@ impl Reasoner {
             Tensor::new(ROLES_T, "binding_roles", ROLES.len(), d2, rows(&fresh.roles)),
             Tensor::new(RELATIONS_T, "binding_roles", RELATIONS.len(), d2, rows(&fresh.rels)),
             Tensor::new(NUMBER_T, "binding_roles", 1, d2, self.space.number(1).data),
+            Tensor::new(ATOM_TABLE_T, "binding_roles", self.atoms.table.rows, d2, self.atoms.table.data.clone()),
             Tensor::new(SLOTS, "relation_memory", self.slots.rows, d2, self.slots.data.clone()),
             Tensor::new(META, "relation_memory", self.meta.rows, field::COUNT, self.meta.data.clone()),
             Tensor::new(CODEBOOK, "relation_memory", self.codebook.rows, d2, self.codebook.data.clone()),
@@ -615,7 +626,7 @@ impl Reasoner {
             ),
         ];
         // Compiled circuit constants (W_PROG), frozen like the role phasors.
-        for c in [&fresh.circuits.graph, &fresh.circuits.reach] {
+        for c in [&fresh.atoms.circuit, &fresh.circuits.graph, &fresh.circuits.reach] {
             for p in &c.tensors {
                 t.push(Tensor::new(&c.qualified(&p.name), zerolm_wsp::compiler::GROUP, p.rows, p.cols, p.data.clone()));
             }
@@ -647,7 +658,7 @@ impl Reasoner {
                 return Err(ReasonerError::Format(format!("unexpected tensor {}", got.name)));
             }
             match got.name.as_str() {
-                name if name == ROLES_T || name == RELATIONS_T || name == NUMBER_T || name.starts_with("prog.") => {
+                name if name == ROLES_T || name == RELATIONS_T || name == NUMBER_T || name == ATOM_TABLE_T || name.starts_with("prog.") => {
                     if got.data.iter().zip(&w.data).any(|(a, b)| a.to_bits() != b.to_bits()) {
                         return Err(ReasonerError::CoreMismatch(got.name));
                     }

@@ -204,7 +204,7 @@ impl Reasoner {
                 self.decide(pos, neg)
             }
             Pred::Greater { dim, other } => {
-                let rel = bind(self.rel("gt"), &self.space().symbol(dim));
+                let rel = bind(self.rel("gt"), &self.symbol(dim));
                 self.order(x, other, &rel, ops.comparison, "comparison")
             }
             Pred::Before(other) => {
@@ -253,7 +253,7 @@ impl Reasoner {
 
     /// Every count of `thing` derivable for `x`, with its proof.
     fn counts(&self, x: usize, thing: &str, depth: usize, visited: &mut BTreeSet<usize>) -> Vec<(i64, Proof)> {
-        let sym = self.space().symbol(thing);
+        let sym = self.symbol(thing);
         let r = self.cfg.number_range;
         let mut out: Vec<(i64, Proof)> = self
             .matches(&[(SUBJ, self.code(x)), (REL, bind(self.rel("has"), &sym))])

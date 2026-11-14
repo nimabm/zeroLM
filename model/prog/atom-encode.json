@@ -1,0 +1,12 @@
+{
+  "id": "atom-encode",
+  "version": 1,
+  "seed_entry": "atom-encode-circuit",
+  "description": "Vector-symbolic atom encoder compiled to the neural ISA: the bytes of a namespaced name (for example 'sym:cat', at positions 1..=len of a 128-byte input) to a unit complex phasor vector. Three salted copies are hashed whole into core.reasoner.atom_table, normalized per component, and bound. dim equals model/specs/reasoning.json.",
+  "circuit": {
+    "kind": "atom_encode",
+    "name_bytes": 128,
+    "buckets": 1024,
+    "dim": 512
+  }
+}

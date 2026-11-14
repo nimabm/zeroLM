@@ -11,6 +11,7 @@ use crate::{field, Reasoner, ReasonerConfig, ROLES};
 use std::collections::BTreeMap;
 use zerolm_engine::binding::Hv;
 use zerolm_engine::isa::{self, bundle, Bindings, Buf, Outputs, View};
+use zerolm_wsp::circuits::atom_encode::Params as AtomParams;
 use zerolm_wsp::circuits::relational::{Params, OPERATORS};
 use zerolm_wsp::{compile, Circuit, Compiled, Spec};
 
@@ -34,6 +35,87 @@ pub fn graph_spec(cfg: &ReasonerConfig) -> Spec {
 
 pub fn reach_spec(cfg: &ReasonerConfig) -> Spec {
     Spec { id: REACH_ID.into(), version: 1, seed_entry: "relation-reach-circuit".into(), description: String::new(), circuit: Circuit::RelationReach(params(cfg)) }
+}
+
+pub const ATOM_ID: &str = "atom-encode";
+
+/// Atom encoder width: names up to `ATOM_BYTES - 1` bytes (longer names are cut).
+pub const ATOM_BYTES: usize = 128;
+/// Rows of `core.reasoner.atom_table`.
+pub const ATOM_BUCKETS: usize = 1024;
+
+pub fn atom_spec(cfg: &ReasonerConfig) -> Spec {
+    Spec {
+        id: ATOM_ID.into(),
+        version: 1,
+        seed_entry: "atom-encode-circuit".into(),
+        description: String::new(),
+        circuit: Circuit::AtomEncode(AtomParams { name_bytes: ATOM_BYTES, buckets: ATOM_BUCKETS, dim: cfg.dim }),
+    }
+}
+
+/// The seeded random hash table of the atom encoder (`core.reasoner.atom_table`).
+pub fn atom_table(cfg: &ReasonerConfig) -> zerolm_tensor::Matrix {
+    let mut rng = zerolm_tensor::Rng::from_tag(cfg.seed, "binding.atom_table");
+    let mut m = zerolm_tensor::Matrix::zeros(ATOM_BUCKETS, 2 * cfg.dim);
+    m.data.iter_mut().for_each(|x| *x = rng.uniform(1.0));
+    m
+}
+
+/// The compiled atom encoder with its table and a cache of its outputs.
+pub struct Atoms {
+    pub circuit: Compiled,
+    pub table: zerolm_tensor::Matrix,
+    cache: std::cell::RefCell<std::collections::HashMap<String, Hv>>,
+    recorder: std::cell::RefCell<Option<Vec<Recorded>>>,
+    dim: usize,
+}
+
+impl Atoms {
+    pub fn new(cfg: &ReasonerConfig) -> Self {
+        Atoms {
+            circuit: compile(&atom_spec(cfg)).expect("valid reasoning config compiles"),
+            table: atom_table(cfg),
+            cache: Default::default(),
+            recorder: Default::default(),
+            dim: cfg.dim,
+        }
+    }
+
+    /// The unit phasor of `namespace:name`, computed by the circuit
+    /// (memoized: the cache holds circuit outputs, keyed by the same bytes).
+    pub fn encode(&self, namespace: &str, name: &str) -> Hv {
+        let key = format!("{namespace}:{name}");
+        if let Some(h) = self.cache.borrow().get(&key) {
+            return h.clone();
+        }
+        let mut row = vec![0.0f32; ATOM_BYTES];
+        for (slot, b) in row[1..].iter_mut().zip(key.bytes()) {
+            *slot = b as f32;
+        }
+        let inputs = vec![("name", Buf::row(row))];
+        let mut w: Vec<(&str, View<'_>)> = vec![("table", view(&self.table, self.table.rows))];
+        w.extend(self.circuit.tensors.iter().map(|t| (t.name.as_str(), t.view())));
+        let mut b = Bindings::new();
+        for (n, t) in &inputs {
+            b = b.input(n, t.clone());
+        }
+        for (n, v) in &w {
+            b = b.weight(n, *v);
+        }
+        let out = isa::run(&self.circuit.program, b).expect("atom circuit runs");
+        if let Some(rec) = self.recorder.borrow_mut().as_mut() {
+            rec.push(Recorded {
+                program: self.circuit.id.clone(),
+                bundle: bundle::encode(&self.circuit.program, &w),
+                inputs: inputs.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
+                outputs: out.clone(),
+            });
+        }
+        let h = Hv::from_data(self.dim, &out.get("atom").data);
+        self.cache.borrow_mut().insert(key, h.clone());
+        h
+    }
 }
 
 pub struct Circuits {
@@ -85,11 +167,14 @@ impl Reasoner {
     /// Start (or stop) recording every circuit run for reference replay.
     pub fn record_circuits(&self, on: bool) {
         *self.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
+        *self.atoms.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
     }
 
     /// Take the runs recorded so far.
     pub fn take_recorded(&self) -> Vec<Recorded> {
-        self.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default()
+        let mut runs = self.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default();
+        runs.extend(self.atoms.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default());
+        runs
     }
 
     /// Bind, run, and (when recording) export one program run.
@@ -186,5 +271,34 @@ impl Reasoner {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerolm_engine::binding::{cosine, sim};
+
+    #[test]
+    fn atoms_are_unit_phasors_distinct_and_deterministic() {
+        let cfg = ReasonerConfig::default();
+        let a = Atoms::new(&cfg);
+        let names = ["cat", "cats", "tom", "tomas", "a", "b", "mammal", "animal", "x1", "x2", "x10"];
+        let vs: Vec<Hv> = names.iter().map(|n| a.encode("sym", n)).collect();
+        for v in &vs {
+            for k in 0..cfg.dim {
+                let m = v.data[k] * v.data[k] + v.data[cfg.dim + k] * v.data[cfg.dim + k];
+                assert!((m - 1.0).abs() < 1e-5, "component {k} has |z|^2 = {m}");
+            }
+        }
+        for i in 0..vs.len() {
+            for j in 0..i {
+                assert!(cosine(&vs[i], &vs[j]).abs() < 0.15, "{} vs {}: {}", names[i], names[j], cosine(&vs[i], &vs[j]));
+            }
+        }
+        assert!((sim(&vs[0], &vs[0]) - 1.0).abs() < 1e-5);
+        let again = Atoms::new(&cfg).encode("sym", "cat");
+        assert_eq!(again.data, vs[0].data);
+        assert!(cosine(&a.encode("role", "cat"), &vs[0]).abs() < 0.15, "namespaces differ");
     }
 }

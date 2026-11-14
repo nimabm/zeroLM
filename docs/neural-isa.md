@@ -82,6 +82,17 @@ The header is `{"program": <Program>, "tensors": [{"name", "rows", "cols"}, ...]
 
 The gate passes when every check holds. The milestone counts as complete only when the pending list is also empty, which means all model behavior is in weights.
 
+## The atom-encode circuit
+
+`model/prog/atom-encode.json`, compiled by `zerolm_wsp::circuits::atom_encode`. It computes the vector of a symbol, role, or relation from the bytes of its namespaced name (for example `sym:cat`), replacing the former host random generator. Input: a row of $L = 128$ byte values with the name at positions $1..\ell$. Bound model tensor: the seeded random table $T$ (`core.reasoner.atom_table`, 1024 rows of $2d$ values, $d = 512$).
+
+1. Make three copies of the row and put salt $j \in \{1, 2, 3\}$ at position 0 (constants: a column of ones and a salt matrix).
+2. `hash_rows` with window $n = L$ (exactly one window per copy) gives rows $h_j = T[\mathrm{FNV1a}(\text{copy}_j) \bmod 1024]$.
+3. Per complex component $k$, normalize the pair $(\mathrm{re}_k, \mathrm{im}_k)$ to unit length: $u_{j,k} = h_{j,k} / \lVert h_{j,k} \rVert$ (reshape, transpose, `norm`).
+4. Bind the three: $a = u_1 \otimes u_2 \otimes u_3$ (elementwise complex product).
+
+Two different names collide only if all three hashes collide (probability about $1024^{-3}$), and the phases of unrelated names are independent, so their cosine is about 0 with standard deviation $1/\sqrt{2d}$. The host copies bytes and memoizes the circuit's output by the same key; it inspects no byte.
+
 ## Why the zero-skip is exact
 
 The engine's transposed `matvec` computes $o_c = \sum_r w_{rc}\, x_r$ left to right from $o_c = +0$, but it skips every $r$ with $x_r = 0$. For finite $w_{rc}$, a skipped term is $w_{rc} \cdot 0 = \pm 0$. In IEEE-754 round-to-nearest arithmetic, $a + (\pm 0) = a$ for every $a \ne 0$, and $(+0) + (-0) = +0$. The sum $u + v$ is $-0$ only when both $u$ and $v$ are $-0$, so an accumulator that starts at $+0$ can never become $-0$. Skipping zero terms therefore leaves every partial sum bit-identical. The reference interpreter does not skip, and the parity tests confirm the equality on every gate query.

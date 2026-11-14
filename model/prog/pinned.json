@@ -1,6 +1,7 @@
 {
   "version": 1,
   "circuits": {
+    "atom-encode": "94a9df214e0da88cbb3b3a59bebe001073ec75fd133e4c36a9ec57ac033ded0e",
     "memory-encode": "99b405aa6bd6a3beaf5f8e87f425a24721e0817f18807408f6ffaae5a8207feb",
     "memory-read": "05a51725faae1cf9282815f82417a3976b5034937bdf7f7ee8449104659d475d",
     "relation-graph": "efefcd319d2f39c8366a3491c1505cbfa8e05287be3293a57fca586ad668bb51",

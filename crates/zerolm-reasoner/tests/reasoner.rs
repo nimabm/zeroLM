@@ -130,8 +130,12 @@ fn pathway_ablations_break_binding_state_and_retrieval() {
     let (r, _) = build(Ops::ALL, Some(Pathway::RecurrentState));
     assert_eq!(r.ask("is rex in farm?").unwrap().verdict, Verdict::Unknown, "'it is in kennel' was never stored");
     let (r, _) = build(Ops::ALL, Some(Pathway::Binding));
-    // Without roles, "tom > ann" and "ann > tom" are the same superposition.
-    assert_ne!(r.ask("is cid taller than tom?").unwrap().verdict, Verdict::No);
+    // Without roles, "a before b" and "b before a" are the same superposition, so
+    // direction is lost: the directed answers cannot all stay right.
+    let (full, _) = build(Ops::ALL, None);
+    let qs = ["did storm happen before harvest?", "did harvest happen before storm?", "is cid taller than tom?", "is tom taller than cid?"];
+    let wrong = qs.iter().filter(|q| r.ask(q).unwrap().verdict != full.ask(q).unwrap().verdict).count();
+    assert!(wrong >= 1, "binding ablation changed none of {} directed answers", qs.len());
 }
 
 #[test]

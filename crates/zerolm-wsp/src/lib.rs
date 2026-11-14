@@ -12,10 +12,11 @@ pub mod patch;
 pub use compiler::{compile, parse_spec, Circuit, Compiled, ProgTensor, Spec};
 
 /// Pinned circuit specifications shipped with the model, as (file name, JSON).
-pub const SPECS: [(&str, &str); 4] = [
+pub const SPECS: [(&str, &str); 5] = [
     ("memory-read.json", include_str!("../../../model/prog/memory-read.json")),
     ("memory-encode.json", include_str!("../../../model/prog/memory-encode.json")),
     ("relation-graph.json", include_str!("../../../model/prog/relation-graph.json")),
+    ("atom-encode.json", include_str!("../../../model/prog/atom-encode.json")),
     ("relation-reach.json", include_str!("../../../model/prog/relation-reach.json")),
 ];
 

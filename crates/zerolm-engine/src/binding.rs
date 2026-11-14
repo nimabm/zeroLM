@@ -1,7 +1,8 @@
 //! Role-filler binding in a complex phasor vector-symbolic space (FHRR).
 //!
 //! A vector `Hv` has `d` complex components stored as `[re_0..re_d, im_0..im_d]`.
-//! Atomic symbols are seeded random unit phasors derived from their name.
+//! Atomic symbols, roles, and relations are unit phasors computed from their
+//! name by the compiled `atom-encode` circuit (`zerolm-wsp`), not here.
 //! - `bind(a, b)`: elementwise complex product (associative, commutative).
 //! - `unbind(a, b)`: elementwise product with the conjugate of `b`; for unit
 //!   phasors `unbind(bind(a, b), b) == a` exactly up to rounding.
@@ -125,7 +126,7 @@ pub fn cosine(a: &Hv, b: &Hv) -> f32 {
     }
 }
 
-/// Seeded vector space: atomic symbols, roles, and numbers.
+/// Seeded number space (fractional-power encoding).
 #[derive(Debug, Clone)]
 pub struct Space {
     pub seed: u64,
@@ -140,21 +141,6 @@ impl Space {
         let mut rng = Rng::from_tag(seed, "binding.number_base");
         let number_base = (0..d).map(|_| (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * TAU - TAU / 2.0).collect();
         Space { seed, d, number_base }
-    }
-
-    /// Unit phasor for a named atom in a namespace ("sym", "role", ...).
-    pub fn atom(&self, namespace: &str, name: &str) -> Hv {
-        let mut rng = Rng::from_tag(self.seed, &format!("binding.{namespace}:{name}"));
-        let angles: Vec<f64> = (0..self.d).map(|_| (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * TAU).collect();
-        Hv::from_angles(&angles)
-    }
-
-    pub fn symbol(&self, name: &str) -> Hv {
-        self.atom("sym", name)
-    }
-
-    pub fn role(&self, name: &str) -> Hv {
-        self.atom("role", name)
     }
 
     /// Fractional-power encoding of an integer.
@@ -202,8 +188,11 @@ mod tests {
 
     #[test]
     fn unbinding_recovers_the_filler_and_bundles_keep_their_parts() {
-        let s = Space::new(1, 512);
-        let (r1, r2, a, b) = (s.role("subj"), s.role("obj"), s.symbol("tom"), s.symbol("cat"));
+        let atom = |tag: &str| {
+            let mut rng = Rng::from_tag(1, tag);
+            Hv::from_angles(&(0..512).map(|_| (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * TAU).collect::<Vec<_>>())
+        };
+        let (r1, r2, a, b) = (atom("subj"), atom("obj"), atom("tom"), atom("cat"));
         let x = bundle(&[bind(&r1, &a), bind(&r2, &b)]);
         let ua = unbind(&x, &r1);
         assert!(cosine(&ua, &a) > 0.6 && cosine(&ua, &b).abs() < 0.15, "{} {}", cosine(&ua, &a), cosine(&ua, &b));

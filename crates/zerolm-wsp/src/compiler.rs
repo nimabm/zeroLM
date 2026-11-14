@@ -30,6 +30,7 @@ pub struct Spec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Circuit {
+    AtomEncode(circuits::atom_encode::Params),
     AttentionRead(circuits::attention_read::Params),
     KeyEncode(circuits::key_encode::Params),
     RelationGraph(circuits::relational::Params),
@@ -115,6 +116,7 @@ impl Compiled {
 
 pub fn compile(spec: &Spec) -> Result<Compiled, IsaError> {
     let c = match &spec.circuit {
+        Circuit::AtomEncode(p) => circuits::atom_encode::compile(&spec.id, p)?,
         Circuit::AttentionRead(p) => circuits::attention_read::compile(&spec.id, p)?,
         Circuit::KeyEncode(p) => circuits::key_encode::compile(&spec.id, p)?,
         Circuit::RelationGraph(p) => circuits::relational::compile_graph(&spec.id, p)?,
