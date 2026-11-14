@@ -9,7 +9,9 @@
     "number-decode": "faf56ddfb8f262aa26784a5da5b9fd40f90f46afbd2202d7e9082dc53ce00aee",
     "number-encode": "bb850fbef9db6f31b63f71ae16e304842f6d2d30ab4aa0348d1d37842ac78c0d",
     "relation-graph": "efefcd319d2f39c8366a3491c1505cbfa8e05287be3293a57fca586ad668bb51",
+    "relation-probe": "bf99f34a4122e34d48f563ab8cf10110f84ab4a1a0462c9794211bf669cfd7c4",
     "relation-reach": "7f6ed8d82ffc0d10f9a63bb897b874d53c54eec33960a4c68122449a1438c6ee",
+    "symbol-cleanup": "6fe3b1e4011cea3a3ec12f99238d6b9254ffacbc29de23ab2bb575f7172ca201",
     "value-encode": "e6240156a25968a4289f20d748a4cf6ed1e65fc9ca59380ed0a468661a170c01",
     "value-match": "06df6685524e9f3a9d8752d6904a68caf63d6fa44f49e38cfac236cb62ac21f7"
   }

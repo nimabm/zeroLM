@@ -39,6 +39,8 @@ pub enum Circuit {
     ValueMatch(circuits::value_codec::CodecParams),
     FastRecall(circuits::value_codec::FastParams),
     FastWrite(circuits::value_codec::FastParams),
+    RelationProbe(circuits::probe::ProbeParams),
+    SymbolCleanup(circuits::probe::CleanupParams),
     RelationGraph(circuits::relational::Params),
     RelationReach(circuits::relational::Params),
 }
@@ -131,6 +133,8 @@ pub fn compile(spec: &Spec) -> Result<Compiled, IsaError> {
         Circuit::ValueMatch(p) => circuits::value_codec::compile_match(&spec.id, p)?,
         Circuit::FastRecall(p) => circuits::value_codec::compile_fast_recall(&spec.id, p)?,
         Circuit::FastWrite(p) => circuits::value_codec::compile_fast_write(&spec.id, p)?,
+        Circuit::RelationProbe(p) => circuits::probe::compile_probe(&spec.id, p)?,
+        Circuit::SymbolCleanup(p) => circuits::probe::compile_cleanup(&spec.id, p)?,
         Circuit::RelationGraph(p) => circuits::relational::compile_graph(&spec.id, p)?,
         Circuit::RelationReach(p) => circuits::relational::compile_reach(&spec.id, p)?,
     };

@@ -20,7 +20,7 @@ pub mod oracle;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use zerolm_engine::binding::{bind, bundle, sim_raw, unbind, Hv};
+use zerolm_engine::binding::{bind, unbind, Hv};
 use zerolm_engine::semantic_state::{parse, Fact, Pred, Rule, SemanticState, Term, Utterance};
 use zerolm_memory::checkpoint::{self, CheckpointError, Tensor};
 use zerolm_tensor::sha256::Sha256;
@@ -293,7 +293,7 @@ pub struct Reasoner {
     /// C5 output for the current memory state (session state, recomputed after writes).
     graph_cache: std::cell::RefCell<Option<circuits::Graph>>,
     /// Evaluation only: recorded circuit runs for reference replay.
-    recorder: std::cell::RefCell<Option<Vec<circuits::Recorded>>>,
+    recorder: circuits::Recorder,
 }
 
 pub(crate) const SUBJ: usize = 0;
@@ -331,7 +331,7 @@ impl Reasoner {
             unsaved_from: 0,
             circuits: circuits::Circuits::new(&cfg),
             graph_cache: std::cell::RefCell::new(None),
-            recorder: std::cell::RefCell::new(None),
+            recorder: Default::default(),
             atoms,
             numbers: circuits::Numbers::new(&cfg),
             cfg,
@@ -388,42 +388,21 @@ impl Reasoner {
         }
     }
 
-    pub(crate) fn encode(&self, parts: &[(usize, Hv)]) -> Hv {
-        let items: Vec<Hv> = parts.iter().map(|(r, f)| bind(&self.role(*r), f)).collect();
-        bundle(&items)
-    }
-
     // ---- Codebook ----
 
     pub(crate) fn code(&self, i: usize) -> Hv {
         Hv::from_data(self.cfg.dim, self.codebook.row(i))
     }
 
-    /// Codebook index of a symbol vector (cosine >= symbol_same).
+    /// Codebook index of a symbol vector (cosine >= symbol_same), by the
+    /// `symbol-cleanup` circuit.
     pub(crate) fn find_symbol(&self, v: &Hv) -> Option<usize> {
-        self.cleanup_with(v, self.cfg.symbol_same)
+        self.symbol_cleanup(v, circuits::CleanupMode::Same)
     }
 
-    /// Nearest codebook entry with cosine >= min.
-    pub(crate) fn cleanup_with(&self, v: &Hv, min: f32) -> Option<usize> {
-        let d = self.cfg.dim;
-        let vn = sim_raw(&v.data, &v.data, d).sqrt();
-        if vn == 0.0 {
-            return None;
-        }
-        let mut best: Option<(usize, f32)> = None;
-        for i in 0..self.n_sym {
-            let row = self.codebook.row(i);
-            let c = sim_raw(row, &v.data, d) / vn; // rows are unit phasors: |row| = 1
-            if c >= min && best.map(|b| c > b.1).unwrap_or(true) {
-                best = Some((i, c));
-            }
-        }
-        best.map(|b| b.0)
-    }
-
+    /// Nearest codebook entry with cosine >= cleanup_min (`symbol-cleanup`).
     pub(crate) fn cleanup(&self, v: &Hv) -> Option<usize> {
-        self.cleanup_with(v, self.cfg.cleanup_min)
+        self.symbol_cleanup(v, circuits::CleanupMode::Cleanup)
     }
 
     /// Index of a name's symbol if it was ever stored.
@@ -448,17 +427,10 @@ impl Reasoner {
 
     // ---- Probes ----
 
-    /// Slots matching every given role-filler pair (sim >= k - margin).
+    /// Slots matching every given role-filler pair (sim >= k - margin), by the
+    /// `relation-probe` circuit.
     pub(crate) fn matches(&self, parts: &[(usize, Hv)]) -> Vec<usize> {
-        if self.retrieval_ablated {
-            return Vec::new();
-        }
-        let q = self.encode(parts);
-        let need = parts.len() as f32 - self.cfg.match_margin;
-        (0..self.n_slots)
-            .filter(|&s| self.slot_meta(s, field::ACTIVE) == 1.0)
-            .filter(|&s| sim_raw(self.slots.row(s), &q.data, self.cfg.dim) >= need)
-            .collect()
+        self.probe(parts, 0.0, !self.retrieval_ablated).hits
     }
 
     pub(crate) fn unbind_slot(&self, slot: usize, role: usize) -> Hv {
@@ -499,23 +471,16 @@ impl Reasoner {
     pub(crate) fn resolve(&self, t: &Term) -> Option<(Hv, bool)> {
         match t {
             Term::Name(n) => Some((self.symbol(n), false)),
-            Term::Pronoun => {
-                let cands: Vec<Hv> = (0..self.n_sym).map(|i| self.code(i)).collect();
-                self.state.resolve(cands.iter().enumerate(), self.cfg.pronoun_min).map(|(i, _)| (cands[i].clone(), true))
-            }
+            // "it": the codebook symbol nearest the discourse state (`symbol-cleanup`, pronoun threshold).
+            Term::Pronoun => self.symbol_cleanup(&self.state.context, circuits::CleanupMode::Pronoun).map(|i| (self.code(i), true)),
         }
     }
 
     fn write(&mut self, parts: &[(usize, Hv)], polarity: f32, kind: f32, confidence: f32, stream: &str) -> Result<Observed, ReasonerError> {
-        let v = self.encode(parts);
-        let full = parts.len() as f32 - self.cfg.match_margin;
-        for s in 0..self.n_slots {
-            if self.slot_meta(s, field::POLARITY) == polarity
-                && self.slot_meta(s, field::N_ROLES) == parts.len() as f32
-                && sim_raw(self.slots.row(s), &v.data, self.cfg.dim) >= full
-            {
-                return Ok(Observed::Duplicate { slot: s });
-            }
+        // The probe circuit bundles the statement and finds an identical stored one.
+        let p = self.probe(parts, polarity, true);
+        if let Some(&s) = p.dups.first() {
+            return Ok(Observed::Duplicate { slot: s });
         }
         if self.n_slots == self.cfg.slots {
             return Err(ReasonerError::Full("relation slots"));
@@ -524,7 +489,7 @@ impl Reasoner {
         self.n_slots += 1;
         self.clock += 1;
         let c = self.slots.cols;
-        self.slots.data[s * c..(s + 1) * c].copy_from_slice(&v.data);
+        self.slots.data[s * c..(s + 1) * c].copy_from_slice(&p.q);
         let h = fnv1a(stream.as_bytes());
         let m = (1u64 << 22) - 1;
         let row = &mut self.meta.data[s * field::COUNT..(s + 1) * field::COUNT];
@@ -628,7 +593,7 @@ impl Reasoner {
             ),
         ];
         // Compiled circuit constants (W_PROG), frozen like the role phasors.
-        for c in [&fresh.atoms.circuit, &fresh.numbers.encoder, &fresh.numbers.decoder, &fresh.circuits.graph, &fresh.circuits.reach] {
+        for c in [&fresh.atoms.circuit, &fresh.numbers.encoder, &fresh.numbers.decoder, &fresh.circuits.graph, &fresh.circuits.reach, &fresh.circuits.probe, &fresh.circuits.cleanup] {
             for p in &c.tensors {
                 t.push(Tensor::new(&c.qualified(&p.name), zerolm_wsp::compiler::GROUP, p.rows, p.cols, p.data.clone()));
             }

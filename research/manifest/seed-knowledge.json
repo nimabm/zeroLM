@@ -94,6 +94,13 @@
       "derived_from_corpus": false
     },
     {
+      "id": "relation-probe-circuits",
+      "kind": "structural_prior",
+      "description": "Circuits relation-probe and symbol-cleanup (model/prog/relation-probe.json, symbol-cleanup.json): a role-filler probe (role selection from core.reasoner.roles, binding, bundling, sim >= K - margin over active slots, polarity and role-count filters from metadata column selectors) and nearest-symbol cleanup (cosine against memory.relations.codebook, top-1, and a threshold chosen by a one-hot mode among cleanup_min, symbol_same, pronoun_min from model/specs/reasoning.json). No vocabulary or facts.",
+      "source": "crates/zerolm-wsp/src/circuits/probe.rs",
+      "derived_from_corpus": false
+    },
+    {
       "id": "number-decode-circuit",
       "kind": "structural_prior",
       "description": "Circuit number-decode (model/prog/number-decode.json): cleanup of a noisy number phasor as a neural ISA program: scores against core.reasoner.number_codebook, top-1, and readout of the integer value (constant column -range..range) and the clean codebook row. No vocabulary or facts.",

@@ -176,6 +176,8 @@ fn default_config_compiles_to_the_shipped_pinned_circuits() {
         (atom_spec(&cfg), ATOM_ID),
         (number_encode_spec(&cfg), NUMBER_ENCODE_ID),
         (number_decode_spec(&cfg), NUMBER_DECODE_ID),
+        (probe_spec(&cfg), PROBE_ID),
+        (cleanup_spec(&cfg), CLEANUP_ID),
     ] {
         let built = zerolm_wsp::compile(&spec).unwrap();
         assert_eq!(built.sha256(), zerolm_wsp::shipped(id).unwrap().sha256(), "{id}: ReasonerConfig::default() must compile to model/prog/{id}.json");

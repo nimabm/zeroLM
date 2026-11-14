@@ -77,7 +77,7 @@ The header is `{"program": <Program>, "tensors": [{"name", "rows", "cols"}, ...]
 | circuits pinned and reproducible | every spec in `model/prog/` compiles twice to the same SHA-256, equal to `model/prog/pinned.json` |
 | patch round trip | for every circuit: a one-value patch applies, a second apply is refused, and revert restores the original hash |
 | memory reference parity | 400 memory queries (taught keys and unknown keys) through `memory-encode` and `memory-read`, plus a short session of new, repeated, and contradicting facts and fast associations through `value-encode`, `value-match`, `fast-write` (including its final `memory.fast` state), and `fast-recall`: 868 runs, reproduced bit for bit from the exported bundles |
-| reasoning reference parity | every circuit run while a generated world is taught and its questions answered, intact and with each operator ablated, replayed on the reference interpreter (1,343 runs, all bit-exact) |
+| reasoning reference parity | every circuit run while a generated world is taught and its questions answered, intact and with each operator ablated, replayed on the reference interpreter (7,783 runs, all bit-exact) |
 | host audit | the model-path files listed in `model/prog/host-audit.json` contain no text processing; host code that still makes content decisions is listed as **pending** |
 
 The gate passes when every check holds. The milestone counts as complete only when the pending list is also empty, which means all model behavior is in weights.
@@ -103,6 +103,15 @@ Two different names collide only if all three hashes collide (probability about 
 - `fast-write`: the same $\sigma$, the value encoded as in `value-encode`, then `delta_write` with learning rate 0 and decay 0.99 (decay only), and `delta_write` with learning rate 1, epsilon $10^{-6}$ and decay 1 (the delta rule on the decayed matrix).
 
 The host copies bytes into input rows and branches only on the circuits' outputs (`same`, the decoded bytes); those branches are memory write bookkeeping, still listed as pending.
+
+## The probe and cleanup circuits
+
+`model/prog/relation-probe.json` and `model/prog/symbol-cleanup.json`, compiled by `zerolm_wsp::circuits::probe`. They replace the reasoner's host probe loop, its host cleanup scan, the discourse-state pronoun scan, and the host bundling of a new statement.
+
+- `relation-probe`: inputs `fillers` ($K \times 2d$) and one-hot `role_sel` ($K \times 5$), and `polarity`. Roles are selected from `core.reasoner.roles` (`matmul`), bound to the fillers, and summed into $q = \sum_k \rho_{r_k} \circledast f_k$ (output `q`, also the row a new statement is stored as). A slot is a hit when it is active and $\mathrm{sim}(\text{slot}, q) \ge K - 0.5$; `hits_pol` keeps hits of the given polarity, and `dups` those that also store exactly $K$ pairs (an identical statement, so the write is refused). With no slots yet, the host binds one all-zero inactive row, so no tensor is empty.
+- `symbol-cleanup`: input $v$ and a one-hot `mode`. Cosines $c_i = C_i \cdot \hat v / \sqrt d$ with every codebook row, the best row, and `found` when $c \ge$ the mode's threshold: 0.3 (cleanup of an unbound filler), 0.9 (the same symbol, for interning and lookups), or 0.4 (resolving "it" from the discourse state; a zero state has cosine 0 and never resolves).
+
+The retrieval ablation binds zero metadata (no slot is active); the binding ablation binds identity role phasors.
 
 ## The number circuits
 

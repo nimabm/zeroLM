@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use zerolm_engine::binding::{Hv, Space};
 use zerolm_engine::isa::{self, bundle, Bindings, Buf, Outputs, View};
 use zerolm_wsp::circuits::atom_encode::Params as AtomParams;
+use zerolm_wsp::circuits::probe::{CleanupParams, ProbeParams};
 use zerolm_wsp::circuits::number::{DecodeParams as NumberDecodeParams, EncodeParams as NumberEncodeParams};
 use zerolm_wsp::circuits::relational::{Params, OPERATORS};
 use zerolm_wsp::{compile, Circuit, Compiled, Spec};
@@ -68,7 +69,7 @@ pub struct Atoms {
     pub circuit: Compiled,
     pub table: zerolm_tensor::Matrix,
     cache: std::cell::RefCell<std::collections::HashMap<String, Hv>>,
-    recorder: std::cell::RefCell<Option<Vec<Recorded>>>,
+    recorder: Recorder,
     dim: usize,
 }
 
@@ -94,25 +95,8 @@ impl Atoms {
         for (slot, b) in row[1..].iter_mut().zip(key.bytes()) {
             *slot = b as f32;
         }
-        let inputs = vec![("name", Buf::row(row))];
-        let mut w: Vec<(&str, View<'_>)> = vec![("table", view(&self.table, self.table.rows))];
-        w.extend(self.circuit.tensors.iter().map(|t| (t.name.as_str(), t.view())));
-        let mut b = Bindings::new();
-        for (n, t) in &inputs {
-            b = b.input(n, t.clone());
-        }
-        for (n, v) in &w {
-            b = b.weight(n, *v);
-        }
-        let out = isa::run(&self.circuit.program, b).expect("atom circuit runs");
-        if let Some(rec) = self.recorder.borrow_mut().as_mut() {
-            rec.push(Recorded {
-                program: self.circuit.id.clone(),
-                bundle: bundle::encode(&self.circuit.program, &w),
-                inputs: inputs.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
-                outputs: out.clone(),
-            });
-        }
+        let w = with_consts(&self.circuit, vec![("table", view(&self.table, self.table.rows))]);
+        let out = run(&self.circuit, vec![("name", Buf::row(row))], &w, &self.recorder);
         let h = Hv::from_data(self.dim, &out.get("atom").data);
         self.cache.borrow_mut().insert(key, h.clone());
         h
@@ -161,7 +145,7 @@ pub struct Numbers {
     pub digits: zerolm_tensor::Matrix,
     pub codebook: zerolm_tensor::Matrix,
     cache: std::cell::RefCell<std::collections::HashMap<i64, Hv>>,
-    recorder: std::cell::RefCell<Option<Vec<Recorded>>>,
+    recorder: Recorder,
     dim: usize,
 }
 
@@ -182,17 +166,7 @@ impl Numbers {
     }
 
     fn run(&self, c: &Compiled, input: (&str, Buf), table: (&str, View<'_>)) -> Outputs {
-        let mut w: Vec<(&str, View<'_>)> = vec![table];
-        w.extend(c.tensors.iter().map(|t| (t.name.as_str(), t.view())));
-        let mut b = Bindings::new().input(input.0, input.1.clone());
-        for (n, v) in &w {
-            b = b.weight(n, *v);
-        }
-        let out = isa::run(&c.program, b).unwrap_or_else(|e| panic!("{} runs: {e}", c.id));
-        if let Some(rec) = self.recorder.borrow_mut().as_mut() {
-            rec.push(Recorded { program: c.id.clone(), bundle: bundle::encode(&c.program, &w), inputs: vec![(input.0.to_string(), input.1)], outputs: out.clone() });
-        }
-        out
+        run(c, vec![input], &with_consts(c, vec![table]), &self.recorder)
     }
 
     /// The phasor of an integer from its decimal numeral bytes, computed by
@@ -229,6 +203,8 @@ impl Numbers {
 pub struct Circuits {
     pub graph: Compiled,
     pub reach: Compiled,
+    pub probe: Compiled,
+    pub cleanup: Compiled,
 }
 
 impl Circuits {
@@ -236,6 +212,8 @@ impl Circuits {
         Circuits {
             graph: compile(&graph_spec(cfg)).expect("valid reasoning config compiles"),
             reach: compile(&reach_spec(cfg)).expect("valid reasoning config compiles"),
+            probe: compile(&probe_spec(cfg)).expect("valid reasoning config compiles"),
+            cleanup: compile(&cleanup_spec(cfg)).expect("valid reasoning config compiles"),
         }
     }
 }
@@ -257,12 +235,150 @@ fn view(m: &zerolm_tensor::Matrix, rows: usize) -> View<'_> {
     View::new(rows, m.cols, &m.data[..rows * m.cols])
 }
 
+/// Records circuit runs for reference replay (evaluation only).
+#[derive(Default)]
+pub struct Recorder {
+    runs: std::cell::RefCell<Option<Vec<Recorded>>>,
+    /// The last bundle of each program, reused while its weights are unchanged.
+    last: std::cell::RefCell<BTreeMap<String, std::sync::Arc<Vec<u8>>>>,
+}
+
+impl Recorder {
+    pub fn set(&self, on: bool) {
+        *self.runs.borrow_mut() = if on { Some(Vec::new()) } else { None };
+        self.last.borrow_mut().clear();
+    }
+
+    pub fn take(&self) -> Vec<Recorded> {
+        self.runs.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default()
+    }
+}
+
+/// The caller's external tensors followed by the program's compiled constants.
+pub(crate) fn with_consts<'a>(c: &'a Compiled, mut ext: Vec<(&'a str, View<'a>)>) -> Vec<(&'a str, View<'a>)> {
+    ext.extend(c.tensors.iter().map(|t| (t.name.as_str(), t.view())));
+    ext
+}
+
+/// Bind, run, and (when recording) export one program run.
+pub(crate) fn run(c: &Compiled, inputs: Vec<(&str, Buf)>, weights: &[(&str, View<'_>)], rec: &Recorder) -> Outputs {
+    let mut b = Bindings::new();
+    for (n, t) in &inputs {
+        b = b.input(n, t.clone());
+    }
+    for (n, v) in weights {
+        b = b.weight(n, *v);
+    }
+    let out = isa::run(&c.program, b).unwrap_or_else(|e| panic!("{} runs on its own memory: {e}", c.id));
+    if let Some(runs) = rec.runs.borrow_mut().as_mut() {
+        let encoded = bundle::encode(&c.program, weights);
+        let mut last = rec.last.borrow_mut();
+        let shared = match last.get(&c.id) {
+            Some(p) if **p == encoded => p.clone(),
+            _ => {
+                let p = std::sync::Arc::new(encoded);
+                last.insert(c.id.clone(), p.clone());
+                p
+            }
+        };
+        runs.push(Recorded { program: c.id.clone(), bundle: shared, inputs: inputs.into_iter().map(|(n, t)| (n.to_string(), t)).collect(), outputs: out.clone() });
+    }
+    out
+}
+
+pub const PROBE_ID: &str = "relation-probe";
+pub const CLEANUP_ID: &str = "symbol-cleanup";
+
+pub fn probe_spec(cfg: &ReasonerConfig) -> Spec {
+    Spec {
+        id: PROBE_ID.into(),
+        version: 1,
+        seed_entry: "relation-probe-circuits".into(),
+        description: String::new(),
+        circuit: Circuit::RelationProbe(ProbeParams { dim: cfg.dim, meta_cols: field::COUNT, n_roles_col: field::N_ROLES, match_margin: cfg.match_margin }),
+    }
+}
+
+pub fn cleanup_spec(cfg: &ReasonerConfig) -> Spec {
+    Spec {
+        id: CLEANUP_ID.into(),
+        version: 1,
+        seed_entry: "relation-probe-circuits".into(),
+        description: String::new(),
+        circuit: Circuit::SymbolCleanup(CleanupParams { dim: cfg.dim, cleanup_min: cfg.cleanup_min, symbol_same: cfg.symbol_same, pronoun_min: cfg.pronoun_min }),
+    }
+}
+
+/// Outputs of one `relation-probe` run, as slot lists.
+#[derive(Debug, Clone, Default)]
+pub struct Probe {
+    /// The bundled query (the row a new statement is stored as).
+    pub q: Vec<f32>,
+    pub hits: Vec<usize>,
+    pub hits_pol: Vec<usize>,
+    pub dups: Vec<usize>,
+}
+
+/// Which threshold `symbol-cleanup` applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupMode {
+    Cleanup,
+    Same,
+    Pronoun,
+}
+
+fn nonzero(b: &Buf) -> Vec<usize> {
+    b.data.iter().enumerate().filter(|(_, &x)| x != 0.0).map(|(i, _)| i).collect()
+}
+
+impl Reasoner {
+    /// Run `relation-probe` for role-filler `parts` (at least one) over the first `n_slots`
+    /// slots (`meta_live`: bind the metadata; false binds zeros, which is the
+    /// retrieval ablation and matches nothing).
+    pub(crate) fn probe(&self, parts: &[(usize, Hv)], polarity: f32, meta_live: bool) -> Probe {
+        let d2 = 2 * self.cfg.dim;
+        let fillers: Vec<f32> = parts.iter().flat_map(|(_, f)| f.data.iter().copied()).collect();
+        let sel: Vec<f32> = parts.iter().flat_map(|(r, _)| (0..ROLES.len()).map(move |j| if j == *r { 1.0 } else { 0.0 })).collect();
+        let roles = self.roles_tensor();
+        // An empty memory is bound as one all-zero inactive row (it never
+        // matches), so every tensor has at least one row.
+        let rows = self.n_slots.max(1);
+        let zero_meta = vec![0.0f32; rows * field::COUNT];
+        let meta = if meta_live && self.n_slots > 0 { view(&self.meta, rows) } else { View::new(rows, field::COUNT, &zero_meta) };
+        let w = with_consts(&self.circuits.probe, vec![("slots", view(&self.slots, rows)), ("meta", meta), ("roles", View::new(ROLES.len(), d2, &roles))]);
+        let inputs = vec![
+            ("fillers", Buf::new(parts.len(), d2, fillers)),
+            ("role_sel", Buf::new(parts.len(), ROLES.len(), sel)),
+            ("polarity", Buf::scalar(polarity)),
+        ];
+        let o = self.exec(&self.circuits.probe, inputs, &w);
+        Probe { q: o.get("q").data.clone(), hits: nonzero(o.get("hits")), hits_pol: nonzero(o.get("hits_pol")), dups: nonzero(o.get("dups")) }
+    }
+
+    /// Run `symbol-cleanup`: the codebook index nearest to `v` if its cosine
+    /// reaches the mode's threshold.
+    pub(crate) fn symbol_cleanup(&self, v: &Hv, mode: CleanupMode) -> Option<usize> {
+        if self.n_sym == 0 {
+            return None;
+        }
+        let m = match mode {
+            CleanupMode::Cleanup => [1.0, 0.0, 0.0],
+            CleanupMode::Same => [0.0, 1.0, 0.0],
+            CleanupMode::Pronoun => [0.0, 0.0, 1.0],
+        };
+        let w = with_consts(&self.circuits.cleanup, vec![("codebook", view(&self.codebook, self.n_sym))]);
+        let o = self.exec(&self.circuits.cleanup, vec![("v", Buf::row(v.data.clone())), ("mode", Buf::row(m.to_vec()))], &w);
+        (o.scalar("found") == 1.0).then(|| o.scalar("best") as usize)
+    }
+}
+
 /// One recorded circuit run (evaluation only): the exported bundle (program
 /// and every weight exactly as bound), the inputs, and the engine's outputs.
 #[derive(Debug, Clone)]
 pub struct Recorded {
     pub program: String,
-    pub bundle: Vec<u8>,
+    /// Shared by consecutive runs of one program with identical weights.
+    pub bundle: std::sync::Arc<Vec<u8>>,
     pub inputs: Vec<(String, Buf)>,
     pub outputs: Outputs,
 }
@@ -274,38 +390,19 @@ impl Reasoner {
 
     /// Start (or stop) recording every circuit run for reference replay.
     pub fn record_circuits(&self, on: bool) {
-        *self.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
-        *self.atoms.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
-        *self.numbers.recorder.borrow_mut() = if on { Some(Vec::new()) } else { None };
+        for r in [&self.recorder, &self.atoms.recorder, &self.numbers.recorder] {
+            r.set(on);
+        }
     }
 
     /// Take the runs recorded so far.
     pub fn take_recorded(&self) -> Vec<Recorded> {
-        let mut runs = self.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default();
-        runs.extend(self.atoms.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default());
-        runs.extend(self.numbers.recorder.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default());
-        runs
+        [&self.recorder, &self.atoms.recorder, &self.numbers.recorder].iter().flat_map(|r| r.take()).collect()
     }
 
     /// Bind, run, and (when recording) export one program run.
     fn exec(&self, c: &Compiled, inputs: Vec<(&str, Buf)>, weights: &[(&str, View<'_>)]) -> Outputs {
-        let mut b = Bindings::new();
-        for (n, t) in &inputs {
-            b = b.input(n, t.clone());
-        }
-        for (n, v) in weights {
-            b = b.weight(n, *v);
-        }
-        let out = isa::run(&c.program, b).unwrap_or_else(|e| panic!("{} runs on its own memory: {e}", c.id));
-        if let Some(rec) = self.recorder.borrow_mut().as_mut() {
-            rec.push(Recorded {
-                program: c.id.clone(),
-                bundle: bundle::encode(&c.program, weights),
-                inputs: inputs.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
-                outputs: out.clone(),
-            });
-        }
-        out
+        run(c, inputs, weights, &self.recorder)
     }
 
     /// The decoded relation graph for the current memory state (cached).

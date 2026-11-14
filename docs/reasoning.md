@@ -50,7 +50,7 @@ The checkpoint uses the memory component's atomic format (`docs/memory-format.md
 
 ### Operators (`crates/zerolm-reasoner/src/operators.rs`)
 
-A **probe** with k role-filler pairs matches a slot when `Re<probe, slot>/d >= k - 0.5`. **Unbinding** a role from a matched slot gives a noisy filler, which is cleaned up to the nearest codebook entry (cosine at least 0.3). Every operator below is programmed control flow over those steps. The depth limit is 8.
+A **probe** with k role-filler pairs matches a slot when `Re<probe, slot>/d >= k - 0.5`. **Unbinding** a role from a matched slot gives a noisy filler, which is cleaned up to the nearest codebook entry (cosine at least 0.3). The probe and the cleanup run as compiled circuits (`relation-probe`, `symbol-cleanup`; see `docs/neural-isa.md`); every operator below is programmed control flow over those steps. The depth limit is 8.
 
 | operator | semantics |
 |---|---|

@@ -41,9 +41,9 @@ use crate::circuits::Reach;
 impl Reasoner {
     /// (target symbol, slot) for every stored edge `from --rel--> target` with `polarity`.
     fn edges(&self, from: usize, rel: &Hv, polarity: f32) -> Vec<(usize, usize)> {
-        self.matches(&[(SUBJ, self.code(from)), (REL, rel.clone())])
+        self.probe(&[(SUBJ, self.code(from)), (REL, rel.clone())], polarity, !self.retrieval_ablated)
+            .hits_pol
             .into_iter()
-            .filter(|&s| self.slot_meta(s, field::POLARITY) == polarity)
             .filter_map(|s| self.cleanup(&self.unbind_slot(s, OBJ)).map(|t| (t, s)))
             .collect()
     }
@@ -257,9 +257,9 @@ impl Reasoner {
     fn counts(&self, x: usize, thing: &str, depth: usize, visited: &mut BTreeSet<usize>) -> Vec<(Decoded, Proof)> {
         let sym = self.symbol(thing);
         let mut out: Vec<(Decoded, Proof)> = self
-            .matches(&[(SUBJ, self.code(x)), (REL, bind(self.rel("has"), &sym))])
+            .probe(&[(SUBJ, self.code(x)), (REL, bind(self.rel("has"), &sym))], 1.0, !self.retrieval_ablated)
+            .hits_pol
             .into_iter()
-            .filter(|&s| self.slot_meta(s, field::POLARITY) == 1.0)
             .map(|s| (self.numbers().decode(&self.unbind_slot(s, QUANT)), Proof::of(vec![s], "direct")))
             .collect();
         if !self.ops.arithmetic || depth >= self.cfg.max_depth || !visited.insert(x) {
