@@ -86,11 +86,10 @@ fn to_t(b: &Buf) -> T {
     T { r: b.rows, c: b.cols, d: b.data.clone() }
 }
 
-/// Every output of the engine equals the reference output bit for bit.
+/// Every output and final state tensor of the engine equals the reference bit for bit.
 fn same(engine: &Outputs, reference: &std::collections::BTreeMap<String, T>) -> bool {
-    engine.values.iter().all(|(n, b)| {
-        reference.get(n).map(|t| t.r == b.rows && t.c == b.cols && t.d.iter().zip(&b.data).all(|(x, y)| x.to_bits() == y.to_bits())).unwrap_or(false)
-    })
+    let eq = |b: &Buf, t: Option<&T>| t.map(|t| t.r == b.rows && t.c == b.cols && t.d.iter().zip(&b.data).all(|(x, y)| x.to_bits() == y.to_bits())).unwrap_or(false);
+    engine.values.iter().all(|(n, b)| eq(b, reference.get(n))) && engine.state.iter().all(|(n, b)| eq(b, reference.get(&format!("state:{n}"))))
 }
 
 fn circuits() -> Result<Vec<CircuitRow>, String> {
@@ -133,6 +132,31 @@ fn memory_parity() -> Result<Parity, String> {
             p.mismatches += !ok as usize;
             *p.by_program.entry(id.into()).or_default() += 1;
         }
+    }
+    // Value codec and W_FAST circuits: a short session of new facts, repeated
+    // facts (unchanged), contradicting facts, fast associations, and recalls.
+    let mut v = MemoryStore::new(MemoryConfig::default()).map_err(|e| e.to_string())?;
+    v.value_circuits().record(true);
+    let me = |e: zerolm_memory::MemoryError| e.to_string();
+    for i in 0..40 {
+        v.teach(&format!("item{i} colour"), &format!("shade{i}"), "uniform:value-codec").map_err(me)?;
+    }
+    for i in 0..20 {
+        let value = if i % 2 == 0 { format!("shade{i}") } else { format!("tint{i}") };
+        v.teach(&format!("item{i} colour"), &value, "uniform:value-codec").map_err(me)?;
+    }
+    for i in 0..4 {
+        v.associate_fast(&format!("door{i} code"), &format!("code{i}"), "uniform:value-codec").map_err(me)?;
+    }
+    for i in 0..4 {
+        v.recall_fast(&format!("door{i} code")).map_err(me)?;
+    }
+    for rec in v.value_circuits().take_recorded() {
+        let inputs: Vec<(&str, T)> = rec.inputs.iter().map(|(n, b)| (n.as_str(), to_t(b))).collect();
+        let ok = same(&rec.outputs, &isa_ref::run(&rec.bundle, &inputs)?);
+        p.runs += 1;
+        p.mismatches += !ok as usize;
+        *p.by_program.entry(rec.program).or_default() += 1;
     }
     Ok(p)
 }

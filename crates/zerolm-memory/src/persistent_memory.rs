@@ -14,13 +14,13 @@
 
 use crate::checkpoint::{self, CheckpointError, Fault, LoadSource, Tensor};
 use crate::encoder::{self, KeyEncoder};
-use crate::fast_weights::{self, FastWeights};
 use crate::read_circuit;
-use crate::retrieval::{self, Decoded};
+use crate::value_circuits::{Decoded, ValueCircuits};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 use zerolm_engine::bootstrap::default_model;
+use zerolm_engine::isa::Buf;
 use zerolm_engine::Model;
 use zerolm_tensor::sha256::Sha256;
 use zerolm_tensor::{fnv1a, shuffle, Matrix};
@@ -35,6 +35,10 @@ pub const EP_META: &str = "memory.episodic.meta";
 pub const STATE: &str = "memory.state";
 pub const EMBED: &str = "core.embed";
 pub const CELL_PREFIX: &str = "core.cell.";
+/// `W_FAST`: the short-lived associative matrix (written by `fast-write`).
+pub const FAST: &str = "memory.fast";
+/// The frozen seeded pattern separator of `W_FAST` keys.
+pub const SEPARATOR: &str = "core.fast_separator";
 
 /// Semantic metadata columns.
 pub mod field {
@@ -319,8 +323,10 @@ pub struct MemoryStore {
     meta: Matrix,
     ep_keys: Matrix,
     ep_meta: Matrix,
-    fast: FastWeights,
+    fast: Matrix,
     separator: Matrix,
+    /// The compiled value codec and `W_FAST` circuits (`W_PROG`).
+    codec: ValueCircuits,
     /// The compiled key encoder (`W_PROG`, `prog.memory-encode.*`).
     encode: Compiled,
     /// The compiled read circuit (`W_PROG`, `prog.memory-read.*`).
@@ -345,6 +351,10 @@ fn prov(stream: &str) -> [f32; 3] {
     let h = fnv1a(stream.as_bytes());
     let m = (1u64 << 22) - 1;
     [(h & m) as f32, ((h >> 22) & m) as f32, (h >> 44) as f32]
+}
+
+fn view(m: &Matrix) -> zerolm_engine::isa::View<'_> {
+    zerolm_engine::isa::View::new(m.rows, m.cols, &m.data)
 }
 
 fn slot_ref(x: f32) -> Option<usize> {
@@ -374,8 +384,9 @@ impl MemoryStore {
             meta,
             ep_keys: Matrix::zeros(cfg.episodic_capacity, cfg.key_dim),
             ep_meta: Matrix::zeros(cfg.episodic_capacity, ep_field::COUNT),
-            fast: FastWeights::new(cfg.positions() * e, cfg.fast_expansion, cfg.fast_decay, cfg.fast_lr),
-            separator: Matrix::uniform(cfg.fast_expansion, cfg.key_dim, cfg.seed, fast_weights::SEPARATOR, 1.0),
+            fast: Matrix::zeros(cfg.positions() * e, cfg.fast_expansion),
+            separator: Matrix::uniform(cfg.fast_expansion, cfg.key_dim, cfg.seed, SEPARATOR, 1.0),
+            codec: ValueCircuits::new(&cfg, core.embed.rows, e),
             encode: read_circuit::build_encoder(&cfg),
             read: read_circuit::build(&cfg, core.embed.rows, e),
             core,
@@ -473,13 +484,19 @@ impl MemoryStore {
         Ok(())
     }
 
-    fn encode_value(&self, value: &str) -> Vec<f32> {
-        retrieval::encode_value(value.as_bytes(), &self.core.embed, self.cfg.positions())
+    fn codes(&self) -> zerolm_engine::isa::View<'_> {
+        view(&self.core.embed)
     }
 
-    /// Decode exactly what one slot holds (used for write-time comparison).
-    fn slot_value(&self, slot: usize) -> Vec<u8> {
-        retrieval::decode(self.values.row(slot), &self.core.embed).bytes
+    /// Code row of a value, computed by the `value-encode` circuit.
+    fn encode_value(&self, value: &str) -> Vec<f32> {
+        self.codec.encode_value(self.codes(), value)
+    }
+
+    /// Whether a slot holds exactly `value` (the `value-match` circuit decodes
+    /// the stored row and compares it; used for write-time comparison).
+    fn holds_value(&self, slot: usize, value: &str) -> bool {
+        self.codec.matches(self.codes(), self.values.row(slot), value).1
     }
 
     /// Active slot whose key is the same fact key: the read circuit's best
@@ -589,7 +606,7 @@ impl MemoryStore {
         let src = Source::UserStatement;
         if let Some(s) = self.find_same(&k) {
             let seq = self.tick();
-            if self.slot_value(s) == value.as_bytes() {
+            if self.holds_value(s, value) {
                 let r = self.episode("unchanged", seq, Some(&k), Some(s), Some(src), stream);
                 self.log(seq, "unchanged", stream, src.signal(), "memory_write", vec![EP_KEYS, EP_META], None, Some(r));
                 return Ok(Outcome::Unchanged { slot: s });
@@ -616,7 +633,7 @@ impl MemoryStore {
         let src = Source::UserCorrection;
         let old = self.find_same(&k);
         if let Some(s) = old {
-            if self.slot_value(s) == value.as_bytes() {
+            if self.holds_value(s, value) {
                 let seq = self.tick();
                 let r = self.episode("unchanged", seq, Some(&k), Some(s), Some(src), stream);
                 self.log(seq, "unchanged", stream, src.signal(), "memory_write", vec![EP_KEYS, EP_META], None, Some(r));
@@ -760,6 +777,11 @@ impl MemoryStore {
         &self.encode
     }
 
+    /// The compiled value codec and `W_FAST` circuits.
+    pub fn value_circuits(&self) -> &ValueCircuits {
+        &self.codec
+    }
+
     /// Zero one block of the read circuit (causal ablation; evaluation only).
     pub fn ablate_circuit(&mut self, block: &str) -> Result<(), zerolm_engine::isa::IsaError> {
         self.read.ablate_block(block)
@@ -834,19 +856,21 @@ impl MemoryStore {
     pub fn associate_fast(&mut self, key: &str, value: &str, stream: &str) -> Result<f32, MemoryError> {
         let k = self.pooled(key)?;
         self.check_value(value)?;
-        let v = self.encode_value(value);
-        let sk = fast_weights::separate(&self.separator, &k, self.cfg.fast_active);
-        let n = self.fast.write(&sk, &v);
+        let before = Buf::new(self.fast.rows, self.fast.cols, std::mem::take(&mut self.fast.data));
+        let after = self.codec.write_fast(view(&self.core.embed), view(&self.separator), before.clone(), &k, value);
+        // Frobenius norm of the change (logging only).
+        let n = before.data.iter().zip(&after.data).map(|(a, b)| (b - a) * (b - a)).sum::<f32>().sqrt();
+        self.fast.data = after.data;
         let seq = self.tick();
         let mut h = Sha256::new();
-        h.update_f32(&self.fast.m.data);
+        h.update_f32(&self.fast.data);
         self.events.push(MemoryEvent {
             seq,
             op: "fast_associate",
             input_stream: stream.into(),
             signal: Source::UserStatement.signal(),
             rule: "fast_delta",
-            changed_tensors: vec![fast_weights::TENSOR],
+            changed_tensors: vec![FAST],
             slot: None,
             rows_sha256: h.finish_hex(),
             checkpoint_sha256: None,
@@ -856,8 +880,7 @@ impl MemoryStore {
 
     pub fn recall_fast(&self, key: &str) -> Result<Decoded, MemoryError> {
         let k = self.pooled(key)?;
-        let sk = fast_weights::separate(&self.separator, &k, self.cfg.fast_active);
-        Ok(retrieval::decode(&self.fast.read(&sk), &self.core.embed))
+        Ok(self.codec.recall_fast(self.codes(), view(&self.separator), view(&self.fast), &k))
     }
 
     /// Damage memory tensors for a causal ablation (evaluation only).
@@ -888,14 +911,14 @@ impl MemoryStore {
 
     // ---- Checkpoint ----
 
-    fn core_tensors(core: &Model, encoder: &KeyEncoder, separator: &Matrix, circuits: [&Compiled; 2]) -> Vec<Tensor> {
+    fn core_tensors(core: &Model, encoder: &KeyEncoder, separator: &Matrix, circuits: &[&Compiled]) -> Vec<Tensor> {
         let mut t = vec![Tensor::new(EMBED, "byte_embed", core.embed.rows, core.embed.cols, core.embed.data.clone())];
         for (name, data) in core.cell.groups() {
             t.push(Tensor::new(&format!("{CELL_PREFIX}{name}"), "recurrent_core", 1, data.len(), data.to_vec()));
         }
         let e = &encoder.table;
         t.push(Tensor::new(encoder::TENSOR, "memory_encoder", e.rows, e.cols, e.data.clone()));
-        t.push(Tensor::new(fast_weights::SEPARATOR, "memory_encoder", separator.rows, separator.cols, separator.data.clone()));
+        t.push(Tensor::new(SEPARATOR, "memory_encoder", separator.rows, separator.cols, separator.data.clone()));
         for prog in circuits {
             for c in &prog.tensors {
                 t.push(Tensor::new(&prog.qualified(&c.name), zerolm_wsp::compiler::GROUP, c.rows, c.cols, c.data.clone()));
@@ -906,7 +929,7 @@ impl MemoryStore {
 
     /// Every tensor of the checkpoint, with its weight group.
     pub fn tensors(&self) -> Vec<Tensor> {
-        let mut t = Self::core_tensors(&self.core, &self.encoder, &self.separator, [&self.encode, &self.read]);
+        let mut t = Self::core_tensors(&self.core, &self.encoder, &self.separator, &[&self.encode, &self.read, &self.codec.encode, &self.codec.matcher, &self.codec.recall, &self.codec.write]);
         let mat = |name: &str, group: &str, m: &Matrix| Tensor::new(name, group, m.rows, m.cols, m.data.clone());
         t.push(mat(KEYS, "memory_keys", &self.keys));
         t.push(mat(KEY_WORDS, "memory_keys", &self.key_words));
@@ -914,7 +937,7 @@ impl MemoryStore {
         t.push(mat(META, "memory_meta", &self.meta));
         t.push(mat(EP_KEYS, "episodic_memory", &self.ep_keys));
         t.push(mat(EP_META, "episodic_memory", &self.ep_meta));
-        t.push(mat(fast_weights::TENSOR, "fast_weights", &self.fast.m));
+        t.push(mat(FAST, "fast_weights", &self.fast));
         let (c0, c1) = split48(self.clock);
         let (e0, e1) = split48(self.ep_count);
         t.push(Tensor::new(STATE, "memory_meta", 1, 4, vec![c0, c1, e0, e1]));
@@ -992,7 +1015,7 @@ impl MemoryStore {
                 META => &mut s.meta.data,
                 EP_KEYS => &mut s.ep_keys.data,
                 EP_META => &mut s.ep_meta.data,
-                fast_weights::TENSOR => &mut s.fast.m.data,
+                FAST => &mut s.fast.data,
                 STATE => {
                     s.clock = join48(got.data[0], got.data[1]);
                     s.ep_count = join48(got.data[2], got.data[3]);

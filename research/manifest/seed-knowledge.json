@@ -87,6 +87,13 @@
       "derived_from_corpus": false
     },
     {
+      "id": "value-codec-circuits",
+      "kind": "structural_prior",
+      "description": "Circuits value-encode, value-match, fast-recall, and fast-write (model/prog/value-*.json, fast-*.json): memory value bytes to rows of core.embed by a byte one-hot (byte indices 0..255); nearest-code cleanup (score 2 x.c - |c|^2, NUL-terminated, top-1 minus top-2 margin) and an exact byte comparison (tolerance 1/2); W_FAST pattern separation by core.fast_separator with k-winners-take-all (amplitude 1/sqrt(active)); and the decayed normalized delta rule as two delta_write instructions (decay 0.99, learning rate 1, epsilon 1e-6, from model/specs/memory.json). No vocabulary or facts.",
+      "source": "crates/zerolm-wsp/src/circuits/value_codec.rs",
+      "derived_from_corpus": false
+    },
+    {
       "id": "number-decode-circuit",
       "kind": "structural_prior",
       "description": "Circuit number-decode (model/prog/number-decode.json): cleanup of a noisy number phasor as a neural ISA program: scores against core.reasoner.number_codebook, top-1, and readout of the integer value (constant column -range..range) and the clean codebook row. No vocabulary or facts.",

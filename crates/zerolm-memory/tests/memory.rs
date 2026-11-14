@@ -405,3 +405,19 @@ fn over_long_text_is_refused_and_changes_nothing() {
     assert!(matches!(m.query(&long), Err(zerolm_memory::MemoryError::TextTooLong { .. })));
     assert_eq!(m.checkpoint_bytes(), before);
 }
+
+#[test]
+fn the_default_value_circuits_are_the_shipped_pinned_specs() {
+    use zerolm_memory::value_circuits;
+    let cfg = zerolm_memory::MemoryConfig::default();
+    let store = zerolm_memory::MemoryStore::new(cfg).unwrap();
+    let tensors = store.tensors();
+    for (spec, built) in value_circuits::specs(&cfg, 256, zerolm_engine::bootstrap::EMBED_DIM).iter().zip(store.value_circuits().all()) {
+        let shipped = zerolm_wsp::shipped(&spec.id).unwrap();
+        assert_eq!(zerolm_wsp::compile(spec).unwrap().sha256(), shipped.sha256(), "MemoryConfig::default() must compile to model/prog/{}.json", spec.id);
+        assert_eq!(built.sha256(), shipped.sha256());
+        let prog: Vec<_> = tensors.iter().filter(|t| t.name.starts_with(&format!("prog.{}.", spec.id))).collect();
+        assert_eq!(prog.len(), shipped.tensors.len());
+        assert!(prog.iter().all(|t| t.group == "w_prog"));
+    }
+}
