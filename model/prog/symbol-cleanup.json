@@ -2,7 +2,7 @@
   "id": "symbol-cleanup",
   "version": 1,
   "seed_entry": "relation-probe-circuits",
-  "description": "Symbol cleanup compiled to the neural ISA: the cosine of a vector with every row of memory.relations.codebook, the best row, and whether it reaches the threshold selected by a one-hot mode (cleanup 0.3, same symbol 0.9, pronoun 0.4). Used for unbound fillers, symbol interning, and resolving 'it' from the discourse state. Thresholds equal model/specs/reasoning.json.",
+  "description": "Symbol cleanup compiled to the neural ISA: the cosine of a vector with every row of memory.relations.codebook, the best row, and whether it reaches the threshold selected by a one-hot mode (cleanup 0.3, same symbol 0.9, pronoun 0.4). Used for symbol interning (with a gate, the row to append when a name has no codebook entry) and resolving 'it' from the discourse state. Thresholds equal model/specs/reasoning.json.",
   "circuit": {
     "kind": "symbol_cleanup",
     "dim": 512,

@@ -104,14 +104,14 @@ Two different names collide only if all three hashes collide (probability about 
 
 The host copies bytes into input rows and branches only on the circuits' outputs (`same`, the decoded bytes); those branches are memory write bookkeeping, still listed as pending.
 
-## The probe and cleanup circuits
+## The reasoner write circuits
 
-`model/prog/relation-probe.json` and `model/prog/symbol-cleanup.json`, compiled by `zerolm_wsp::circuits::probe`. They replace the reasoner's host probe loop, its host cleanup scan, the discourse-state pronoun scan, and the host bundling of a new statement.
+`model/prog/relation-probe.json` and `model/prog/symbol-cleanup.json`, compiled by `zerolm_wsp::circuits::probe`. They decide every reasoner write; the host only appends their output rows at its slot and codebook counters (and refuses a write past capacity).
 
-- `relation-probe`: inputs `fillers` ($K \times 2d$) and one-hot `role_sel` ($K \times 5$), and `polarity`. Roles are selected from `core.reasoner.roles` (`matmul`), bound to the fillers, and summed into $q = \sum_k \rho_{r_k} \circledast f_k$ (output `q`, also the row a new statement is stored as). A slot is a hit when it is active and $\mathrm{sim}(\text{slot}, q) \ge K - 0.5$; `hits_pol` keeps hits of the given polarity, and `dups` those that also store exactly $K$ pairs (an identical statement, so the write is refused). With no slots yet, the host binds one all-zero inactive row, so no tensor is empty.
-- `symbol-cleanup`: input $v$ and a one-hot `mode`. Cosines $c_i = C_i \cdot \hat v / \sqrt d$ with every codebook row, the best row, and `found` when $c \ge$ the mode's threshold: 0.3 (cleanup of an unbound filler), 0.9 (the same symbol, for interning and lookups), or 0.4 (resolving "it" from the discourse state; a zero state has cosine 0 and never resolves).
+- `relation-probe` (a statement): inputs `fillers` ($K \times 2d$), one-hot `role_sel` ($K \times 5$), the metadata `record` the statement would get, `gate` (1 when the subject resolved), and the discourse state. Roles are selected from `core.reasoner.roles`, bound to the fillers, and summed into $q = \sum_k \rho_{r_k} \circledast f_k$. An active slot with the record's polarity, $K$ stored pairs, and $\mathrm{sim}(\text{slot}, q) \ge K - 0.5$ is a duplicate. `stored` $=$ gate $\cdot$ (1 $-$ duplicate); the outputs `row` $= \text{stored} \cdot q$ and `meta_row` $= \text{stored} \cdot \text{record}$ are what the host appends; `context_out` is $0.5\,c + s$ (s the subject filler) when gate is 1, else $c$. With no slots yet, the host binds one all-zero inactive row, so no tensor is empty.
+- `symbol-cleanup` (a name or "it"): input $v$, a one-hot `mode`, and `gate`. Cosines $c_i = C_i \cdot \hat v / \sqrt d$ with every codebook row, the best row, and `found` when $c \ge$ the mode's threshold: 0.9 (the same symbol) or 0.4 (resolving "it" from the discourse state; a zero state never resolves). `added` $=$ gate $\cdot$ (1 $-$ found) and `row` $=$ added $\cdot v$: interning appends that row. An empty codebook is bound as one zero row.
 
-The retrieval ablation binds zero metadata (no slot is active); the binding ablation binds identity role phasors.
+The binding ablation binds identity role phasors; the discourse-state ablation keeps the state at zero.
 
 ## The decision circuits
 

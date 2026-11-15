@@ -405,19 +405,19 @@ impl Reasoner {
         self.find_symbol(&self.symbol(name))
     }
 
-    fn intern(&mut self, name: &str) -> Result<usize, ReasonerError> {
-        let v = self.symbol(name);
-        if let Some(i) = self.find_symbol(&v) {
-            return Ok(i);
+    /// Intern a name: `symbol-cleanup` decides whether its vector is new (and
+    /// `gate` is 1); the host appends the circuit's row at the codebook counter.
+    fn intern(&mut self, name: &str, gate: f32) -> Result<(), ReasonerError> {
+        let c = self.symbol_cleanup_full(&self.symbol(name), circuits::CleanupMode::Same, gate);
+        if c.added {
+            if self.n_sym == self.cfg.symbols {
+                return Err(ReasonerError::Full("codebook"));
+            }
+            let (i, w) = (self.n_sym, self.codebook.cols);
+            self.codebook.data[i * w..(i + 1) * w].copy_from_slice(&c.row);
+            self.n_sym += 1;
         }
-        if self.n_sym == self.cfg.symbols {
-            return Err(ReasonerError::Full("codebook"));
-        }
-        let i = self.n_sym;
-        let c = self.codebook.cols;
-        self.codebook.data[i * c..(i + 1) * c].copy_from_slice(&v.data);
-        self.n_sym += 1;
-        Ok(i)
+        Ok(())
     }
 
     // ---- Language interface ----
@@ -450,42 +450,62 @@ impl Reasoner {
         }
     }
 
-    /// Resolve a subject term to a codebook vector; `None` if "it" is unresolved.
-    pub(crate) fn resolve(&self, t: &Term) -> Option<(Hv, bool)> {
+    /// Resolve a subject term to (vector, via pronoun, resolved). An
+    /// unresolved "it" is the zero vector with `resolved` 0.
+    pub(crate) fn resolve_gated(&self, t: &Term) -> (Hv, bool, f32) {
         match t {
-            Term::Name(n) => Some((self.symbol(n), false)),
+            Term::Name(n) => (self.symbol(n), false, 1.0),
             // "it": the codebook symbol nearest the discourse state (`symbol-cleanup`, pronoun threshold).
-            Term::Pronoun => self.symbol_cleanup(&self.state.context, circuits::CleanupMode::Pronoun).map(|i| (self.code(i), true)),
+            Term::Pronoun => match self.symbol_cleanup(&self.state.context, circuits::CleanupMode::Pronoun) {
+                Some(i) => (self.code(i), true, 1.0),
+                None => (Hv::zeros(self.cfg.dim), true, 0.0),
+            },
         }
     }
 
-    fn write(&mut self, parts: &[(usize, Hv)], polarity: f32, kind: f32, confidence: f32, stream: &str) -> Result<Observed, ReasonerError> {
-        // The probe circuit bundles the statement and finds an identical stored one.
-        let p = self.probe(parts, polarity, true);
-        if let Some(&s) = p.dups.first() {
-            return Ok(Observed::Duplicate { slot: s });
+    /// Resolve a subject term to a codebook vector; `None` if "it" is unresolved.
+    pub(crate) fn resolve(&self, t: &Term) -> Option<(Hv, bool)> {
+        let (v, via, ok) = self.resolve_gated(t);
+        (ok == 1.0).then_some((v, via))
+    }
+
+    /// Store a statement: `relation-probe` decides (resolved and not a
+    /// duplicate) and computes the slot and metadata rows; the host appends
+    /// them at the slot counter and logs the write.
+    fn write(&mut self, parts: &[(usize, Hv)], polarity: f32, kind: f32, confidence: f32, gate: f32, stream: &str) -> Result<Observed, ReasonerError> {
+        let seq = self.clock + 1;
+        let h = fnv1a(stream.as_bytes());
+        let m = (1u64 << 22) - 1;
+        let mut record = vec![0.0f32; field::COUNT];
+        record[field::ACTIVE] = 1.0;
+        record[field::POLARITY] = polarity;
+        record[field::CONFIDENCE] = confidence;
+        record[field::KIND] = kind;
+        record[field::SEQ_LO] = (seq % P24) as f32;
+        record[field::SEQ_HI] = (seq / P24 % P24) as f32;
+        record[field::PROV] = (h & m) as f32;
+        record[field::PROV + 1] = ((h >> 22) & m) as f32;
+        record[field::PROV + 2] = (h >> 44) as f32;
+        record[field::N_ROLES] = parts.len() as f32;
+        let st = self.store(parts, &record, gate);
+        if self.state.enabled && kind != RULE_KIND {
+            self.state.context = st.context.clone();
+        }
+        if !st.stored {
+            return Ok(match st.dup_slot {
+                Some(s) if gate == 1.0 => Observed::Duplicate { slot: s },
+                _ => Observed::Unresolved,
+            });
         }
         if self.n_slots == self.cfg.slots {
             return Err(ReasonerError::Full("relation slots"));
         }
         let s = self.n_slots;
         self.n_slots += 1;
-        self.clock += 1;
+        self.clock = seq;
         let c = self.slots.cols;
-        self.slots.data[s * c..(s + 1) * c].copy_from_slice(&p.q);
-        let h = fnv1a(stream.as_bytes());
-        let m = (1u64 << 22) - 1;
-        let row = &mut self.meta.data[s * field::COUNT..(s + 1) * field::COUNT];
-        row[field::ACTIVE] = 1.0;
-        row[field::POLARITY] = polarity;
-        row[field::CONFIDENCE] = confidence;
-        row[field::KIND] = kind;
-        row[field::SEQ_LO] = (self.clock % P24) as f32;
-        row[field::SEQ_HI] = (self.clock / P24 % P24) as f32;
-        row[field::PROV] = (h & m) as f32;
-        row[field::PROV + 1] = ((h >> 22) & m) as f32;
-        row[field::PROV + 2] = (h >> 44) as f32;
-        row[field::N_ROLES] = parts.len() as f32;
+        self.slots.data[s * c..(s + 1) * c].copy_from_slice(&st.row);
+        self.meta.data[s * field::COUNT..(s + 1) * field::COUNT].copy_from_slice(&st.meta_row);
         let mut sh = Sha256::new();
         sh.update_f32(self.slots.row(s));
         sh.update_f32(self.meta.row(s));
@@ -503,23 +523,21 @@ impl Reasoner {
     }
 
     pub fn teach_fact(&mut self, f: &Fact, stream: &str) -> Result<Observed, ReasonerError> {
-        let Some((s, via_pronoun)) = self.resolve(&f.subj) else { return Ok(Observed::Unresolved) };
+        let (s, via_pronoun, gate) = self.resolve_gated(&f.subj);
         if let Term::Name(n) = &f.subj {
-            self.intern(n)?;
+            self.intern(n, gate)?;
         }
         for n in Self::pred_symbols(&f.pred) {
-            self.intern(n)?;
+            self.intern(n, gate)?;
         }
         let parts = self.pred_parts(&s, &f.pred);
         let conf = if via_pronoun { self.cfg.pronoun_confidence } else { 1.0 };
-        let out = self.write(&parts, if f.negated { -1.0 } else { 1.0 }, pred_code(&f.pred), conf, stream)?;
-        self.state.observe_subject(&s);
-        Ok(out)
+        self.write(&parts, if f.negated { -1.0 } else { 1.0 }, pred_code(&f.pred), conf, gate, stream)
     }
 
     pub fn teach_rule(&mut self, r: &Rule, stream: &str) -> Result<Observed, ReasonerError> {
         for n in [&r.premise, &r.conclusion].into_iter().chain(r.scope.as_ref()) {
-            self.intern(n)?;
+            self.intern(n, 1.0)?;
         }
         let scope = match &r.scope {
             Some(x) => self.symbol(x),
@@ -531,7 +549,7 @@ impl Reasoner {
             (OBJ, self.symbol(&r.conclusion)),
             (SCOPE, scope),
         ];
-        self.write(&parts, 1.0, RULE_KIND, 1.0, stream)
+        self.write(&parts, 1.0, RULE_KIND, 1.0, 1.0, stream)
     }
 
     /// Process one line: statements are stored, questions are answered.

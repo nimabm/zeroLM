@@ -328,7 +328,7 @@ pub fn probe_spec(cfg: &ReasonerConfig) -> Spec {
         version: 1,
         seed_entry: "relation-probe-circuits".into(),
         description: String::new(),
-        circuit: Circuit::RelationProbe(ProbeParams { dim: cfg.dim, meta_cols: field::COUNT, n_roles_col: field::N_ROLES, match_margin: cfg.match_margin }),
+        circuit: Circuit::RelationProbe(ProbeParams { dim: cfg.dim, meta_cols: field::COUNT, n_roles_col: field::N_ROLES, match_margin: cfg.match_margin, discourse_decay: cfg.pronoun_decay }),
     }
 }
 
@@ -342,66 +342,87 @@ pub fn cleanup_spec(cfg: &ReasonerConfig) -> Spec {
     }
 }
 
-/// Outputs of one `relation-probe` run, as slot lists.
-#[derive(Debug, Clone, Default)]
-pub struct Probe {
-    /// The bundled query (the row a new statement is stored as).
-    pub q: Vec<f32>,
-    pub hits: Vec<usize>,
-    pub hits_pol: Vec<usize>,
-    pub dups: Vec<usize>,
+/// Outputs of one `relation-probe` (statement write) run.
+#[derive(Debug, Clone)]
+pub struct Store {
+    /// The circuit decided to store the statement (resolved and not a duplicate).
+    pub stored: bool,
+    /// The slot row and metadata row to append (zero when nothing is stored).
+    pub row: Vec<f32>,
+    pub meta_row: Vec<f32>,
+    /// The lowest duplicate slot, if the statement is already stored.
+    pub dup_slot: Option<usize>,
+    /// The discourse state after the statement.
+    pub context: Hv,
+}
+
+/// Outputs of one `symbol-cleanup` run.
+#[derive(Debug, Clone)]
+pub struct Cleaned {
+    pub found: Option<usize>,
+    /// The circuit decided to add `row` to the codebook (a new symbol).
+    pub added: bool,
+    pub row: Vec<f32>,
 }
 
 /// Which threshold `symbol-cleanup` applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupMode {
-    Cleanup,
     Same,
     Pronoun,
 }
 
-fn nonzero(b: &Buf) -> Vec<usize> {
-    b.data.iter().enumerate().filter(|(_, &x)| x != 0.0).map(|(i, _)| i).collect()
-}
-
 impl Reasoner {
-    /// Run `relation-probe` for role-filler `parts` (at least one) over the first `n_slots`
-    /// slots (`meta_live`: bind the metadata; false binds zeros, which is the
-    /// retrieval ablation and matches nothing).
-    pub(crate) fn probe(&self, parts: &[(usize, Hv)], polarity: f32, meta_live: bool) -> Probe {
+    /// Run `relation-probe` for a statement's role-filler `parts` with the
+    /// metadata `record` it would get; `gate` is 1 when its subject resolved.
+    /// An empty memory is bound as one all-zero inactive row (it never
+    /// matches), so every tensor has at least one row.
+    pub(crate) fn store(&self, parts: &[(usize, Hv)], record: &[f32], gate: f32) -> Store {
         let d2 = 2 * self.cfg.dim;
         let fillers: Vec<f32> = parts.iter().flat_map(|(_, f)| f.data.iter().copied()).collect();
         let sel: Vec<f32> = parts.iter().flat_map(|(r, _)| (0..ROLES.len()).map(move |j| if j == *r { 1.0 } else { 0.0 })).collect();
         let roles = self.roles_tensor();
-        // An empty memory is bound as one all-zero inactive row (it never
-        // matches), so every tensor has at least one row.
         let rows = self.n_slots.max(1);
         let zero_meta = vec![0.0f32; rows * field::COUNT];
-        let meta = if meta_live && self.n_slots > 0 { view(&self.meta, rows) } else { View::new(rows, field::COUNT, &zero_meta) };
+        let meta = if self.n_slots > 0 { view(&self.meta, rows) } else { View::new(rows, field::COUNT, &zero_meta) };
         let w = with_consts(&self.circuits.probe, vec![("slots", view(&self.slots, rows)), ("meta", meta), ("roles", View::new(ROLES.len(), d2, &roles))]);
         let inputs = vec![
             ("fillers", Buf::new(parts.len(), d2, fillers)),
             ("role_sel", Buf::new(parts.len(), ROLES.len(), sel)),
-            ("polarity", Buf::scalar(polarity)),
+            ("record", Buf::row(record.to_vec())),
+            ("gate", Buf::scalar(gate)),
+            ("context", Buf::row(self.state.context.data.clone())),
         ];
         let o = self.exec(&self.circuits.probe, inputs, &w);
-        Probe { q: o.get("q").data.clone(), hits: nonzero(o.get("hits")), hits_pol: nonzero(o.get("hits_pol")), dups: nonzero(o.get("dups")) }
+        Store {
+            stored: o.scalar("stored") == 1.0,
+            row: o.get("row").data.clone(),
+            meta_row: o.get("meta_row").data.clone(),
+            dup_slot: (o.scalar("dup") == 1.0).then(|| o.scalar("dup_slot") as usize),
+            context: Hv::from_data(self.cfg.dim, &o.get("context_out").data),
+        }
     }
 
-    /// Run `symbol-cleanup`: the codebook index nearest to `v` if its cosine
-    /// reaches the mode's threshold.
-    pub(crate) fn symbol_cleanup(&self, v: &Hv, mode: CleanupMode) -> Option<usize> {
-        if self.n_sym == 0 {
-            return None;
-        }
+    /// Run `symbol-cleanup`. With `gate` 1, a vector with no codebook entry
+    /// is returned as the row to add. An empty codebook is bound as one zero
+    /// row (cosine 0, never found).
+    pub(crate) fn symbol_cleanup_full(&self, v: &Hv, mode: CleanupMode, gate: f32) -> Cleaned {
         let m = match mode {
-            CleanupMode::Cleanup => [1.0, 0.0, 0.0],
             CleanupMode::Same => [0.0, 1.0, 0.0],
             CleanupMode::Pronoun => [0.0, 0.0, 1.0],
         };
-        let w = with_consts(&self.circuits.cleanup, vec![("codebook", view(&self.codebook, self.n_sym))]);
-        let o = self.exec(&self.circuits.cleanup, vec![("v", Buf::row(v.data.clone())), ("mode", Buf::row(m.to_vec()))], &w);
-        (o.scalar("found") == 1.0).then(|| o.scalar("best") as usize)
+        let rows = self.n_sym.max(1);
+        let zero = vec![0.0f32; 2 * self.cfg.dim];
+        let book = if self.n_sym > 0 { view(&self.codebook, rows) } else { View::new(1, 2 * self.cfg.dim, &zero) };
+        let w = with_consts(&self.circuits.cleanup, vec![("codebook", book)]);
+        let inputs = vec![("v", Buf::row(v.data.clone())), ("mode", Buf::row(m.to_vec())), ("gate", Buf::scalar(gate))];
+        let o = self.exec(&self.circuits.cleanup, inputs, &w);
+        Cleaned { found: (o.scalar("found") == 1.0).then(|| o.scalar("best") as usize), added: o.scalar("added") == 1.0, row: o.get("row").data.clone() }
+    }
+
+    /// The codebook index nearest to `v` if its cosine reaches the mode's threshold.
+    pub(crate) fn symbol_cleanup(&self, v: &Hv, mode: CleanupMode) -> Option<usize> {
+        self.symbol_cleanup_full(v, mode, 0.0).found
     }
 }
 
