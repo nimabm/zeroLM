@@ -1,19 +1,24 @@
-//! The compiled value codec and `W_FAST` circuits bound to a store
-//! (`zerolm_wsp::circuits::value_codec`): `value-encode` turns value bytes
-//! into code rows, `value-match` decodes a stored row and compares it with a
-//! candidate value, `fast-recall` and `fast-write` read and update the
-//! short-lived associative matrix `memory.fast`. The host copies bytes into
+//! The compiled value codec, `W_FAST`, and write circuits bound to a store
+//! (`zerolm_wsp::circuits::{value_codec, memory_write}`): `value-encode` turns
+//! value bytes into code rows, `fast-recall` and `fast-write` read and update
+//! the short-lived associative matrix `memory.fast`, and `memory-write`,
+//! `memory-forget`, `memory-compact`, and `memory-history` decide every change
+//! to the semantic and episodic memory (the host moves the rows they specify). The host copies bytes into
 //! input rows, binds model tensors, and reads outputs; it inspects no byte.
 
 use crate::persistent_memory::MemoryConfig;
 use zerolm_engine::isa::{self, bundle, Bindings, Buf, Outputs, View};
+use zerolm_wsp::circuits::memory_write::WriteParams;
 use zerolm_wsp::circuits::value_codec::{CodecParams, FastParams};
 use zerolm_wsp::{compile, Circuit, Compiled, Spec};
 
 pub const ENCODE_ID: &str = "value-encode";
-pub const MATCH_ID: &str = "value-match";
 pub const RECALL_ID: &str = "fast-recall";
 pub const WRITE_ID: &str = "fast-write";
+pub const MEM_WRITE_ID: &str = "memory-write";
+pub const FORGET_ID: &str = "memory-forget";
+pub const COMPACT_ID: &str = "memory-compact";
+pub const HISTORY_ID: &str = "memory-history";
 /// Normalization epsilon of the fast-weight delta rule.
 pub const FAST_EPS: f32 = 1e-6;
 
@@ -33,18 +38,38 @@ fn fast(cfg: &MemoryConfig, code_rows: usize, code_dim: usize) -> FastParams {
     }
 }
 
-fn spec(id: &str, circuit: Circuit) -> Spec {
-    Spec { id: id.into(), version: 1, seed_entry: "value-codec-circuits".into(), description: String::new(), circuit }
+fn write(cfg: &MemoryConfig, code_rows: usize, code_dim: usize) -> WriteParams {
+    WriteParams {
+        codec: codec(cfg, code_rows, code_dim),
+        slots: cfg.slots,
+        key_dim: cfg.key_dim,
+        key_words: cfg.max_key_words * cfg.key_dim,
+        episodes: cfg.episodic_capacity,
+        same_key_threshold: cfg.same_key_threshold,
+        unconfirmed: crate::persistent_memory::UNCONFIRMED,
+        confirmed: crate::persistent_memory::CONFIRMED,
+    }
 }
 
-/// The four specs for a configuration and code table shape (equal to the
+fn spec(id: &str, circuit: Circuit) -> Spec {
+    let seed_entry = match id {
+        MEM_WRITE_ID | FORGET_ID | COMPACT_ID | HISTORY_ID => "memory-write-circuits",
+        _ => "value-codec-circuits",
+    };
+    Spec { id: id.into(), version: 1, seed_entry: seed_entry.into(), description: String::new(), circuit }
+}
+
+/// The seven specs for a configuration and code table shape (equal to the
 /// shipped specs for the frozen default configuration).
-pub fn specs(cfg: &MemoryConfig, code_rows: usize, code_dim: usize) -> [Spec; 4] {
+pub fn specs(cfg: &MemoryConfig, code_rows: usize, code_dim: usize) -> [Spec; 7] {
     [
         spec(ENCODE_ID, Circuit::ValueEncode(codec(cfg, code_rows, code_dim))),
-        spec(MATCH_ID, Circuit::ValueMatch(codec(cfg, code_rows, code_dim))),
         spec(RECALL_ID, Circuit::FastRecall(fast(cfg, code_rows, code_dim))),
         spec(WRITE_ID, Circuit::FastWrite(fast(cfg, code_rows, code_dim))),
+        spec(MEM_WRITE_ID, Circuit::MemoryWrite(write(cfg, code_rows, code_dim))),
+        spec(FORGET_ID, Circuit::MemoryForget(write(cfg, code_rows, code_dim))),
+        spec(COMPACT_ID, Circuit::MemoryCompact(write(cfg, code_rows, code_dim))),
+        spec(HISTORY_ID, Circuit::MemoryHistory(write(cfg, code_rows, code_dim))),
     ]
 }
 
@@ -70,21 +95,24 @@ pub struct Recorded {
 
 pub struct ValueCircuits {
     pub encode: Compiled,
-    pub matcher: Compiled,
     pub recall: Compiled,
     pub write: Compiled,
+    pub mem_write: Compiled,
+    pub forget: Compiled,
+    pub compact: Compiled,
+    pub history: Compiled,
     positions: usize,
     recorder: std::cell::RefCell<Option<Vec<Recorded>>>,
 }
 
 impl ValueCircuits {
     pub fn new(cfg: &MemoryConfig, code_rows: usize, code_dim: usize) -> Self {
-        let [e, m, r, w] = specs(cfg, code_rows, code_dim).map(|s| compile(&s).expect("valid memory configuration compiles"));
-        ValueCircuits { encode: e, matcher: m, recall: r, write: w, positions: cfg.positions(), recorder: Default::default() }
+        let [encode, recall, write, mem_write, forget, compact, history] = specs(cfg, code_rows, code_dim).map(|s| compile(&s).expect("valid memory configuration compiles"));
+        ValueCircuits { encode, recall, write, mem_write, forget, compact, history, positions: cfg.positions(), recorder: Default::default() }
     }
 
-    pub fn all(&self) -> [&Compiled; 4] {
-        [&self.encode, &self.matcher, &self.recall, &self.write]
+    pub fn all(&self) -> [&Compiled; 7] {
+        [&self.encode, &self.recall, &self.write, &self.mem_write, &self.forget, &self.compact, &self.history]
     }
 
     /// Value bytes copied into a NUL-padded row (data movement only). The
@@ -133,10 +161,9 @@ impl ValueCircuits {
         o.get("row").data.clone()
     }
 
-    /// Decode a stored row and compare it with `value` (`value-match`).
-    pub fn matches(&self, codes: View<'_>, row: &[f32], value: &str) -> (Decoded, bool) {
-        let o = self.run(&self.matcher, vec![("row", Buf::row(row.to_vec())), ("value", self.value_input(value))], &[("codes", codes)], None);
-        (decoded(&o), o.scalar("same") == 1.0)
+    /// Run one of the write circuits with its inputs and bound tensors.
+    pub fn decide(&self, c: &Compiled, inputs: Vec<(&str, Buf)>, weights: &[(&str, View<'_>)]) -> Outputs {
+        self.run(c, inputs, weights, None)
     }
 
     /// Recall from `W_FAST` (`fast-recall`).
@@ -179,22 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn encoded_rows_are_the_code_rows_and_match_decodes_them_back() {
+    fn encoded_rows_are_the_code_rows() {
         let (cfg, codes, _, c) = setup();
         let row = c.encode_value(v(&codes), "blue");
         assert_eq!(row.len(), cfg.positions() * codes.cols);
         for (p, b) in b"blue\0\0".iter().enumerate() {
             assert_eq!(&row[p * codes.cols..(p + 1) * codes.cols], codes.row(*b as usize), "position {p}");
         }
-        let (d, same) = c.matches(v(&codes), &row, "blue");
-        assert!(same && d.bytes == b"blue" && d.margin > 0.0);
-        for other in ["blu", "blues", "bluf", "x"] {
-            assert!(!c.matches(v(&codes), &row, other).1, "{other}");
-        }
-        // A superposition decodes to its dominant value.
-        let green = c.encode_value(v(&codes), "green");
-        let mix: Vec<f32> = row.iter().zip(&green).map(|(a, b)| 0.9 * a + 0.1 * b).collect();
-        assert!(c.matches(v(&codes), &mix, "blue").1);
     }
 
     #[test]

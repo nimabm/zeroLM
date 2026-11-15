@@ -9,9 +9,6 @@
 //! - `value-encode`: value bytes (1 x positions) to the code row
 //!   (1 x positions * code_dim): a byte one-hot (compare with 0..code_rows)
 //!   times the code table.
-//! - `value-match`: a stored code row and candidate value bytes to the
-//!   decoded bytes, the decode margin, and `same` (1 when the decoded bytes
-//!   equal the candidate at every position).
 //! - `fast-recall`: a pooled key (1 x key_dim) to the bytes recalled from
 //!   `W_FAST`: pattern separation s = kWTA(P k) (the `active` largest entries
 //!   set to 1/sqrt(active), ties to the lower index), the read M s, and
@@ -27,7 +24,7 @@
 //! and including the first NUL.
 //!
 //! Blocks (units of ablation): `onehot` (byte indices), `decode` (score
-//! scale, margin selector), `compare` (match tolerance), `separate` (the
+//! scale, margin selector), `separate` (the
 //! kWTA amplitude), `plasticity` (learning rate, decay, epsilon), `support`
 //! (shared constants 1 and a large penalty).
 
@@ -60,14 +57,13 @@ pub struct FastParams {
 }
 
 pub const ENCODE_OUTPUTS: [&str; 1] = ["row"];
-pub const MATCH_OUTPUTS: [&str; 3] = ["bytes", "margin", "same"];
 pub const RECALL_OUTPUTS: [&str; 2] = ["bytes", "margin"];
 pub const WRITE_OUTPUTS: [&str; 1] = ["sparse"];
 
 /// Penalty for excluded margins (finite).
 const BIG: f32 = 1e30;
 
-fn check(id: &str, p: &CodecParams) -> Result<(), IsaError> {
+pub(crate) fn check(id: &str, p: &CodecParams) -> Result<(), IsaError> {
     if p.positions == 0 || p.code_rows < 2 || p.code_rows > 256 || p.code_dim == 0 {
         return Err(IsaError(format!("{id}: invalid value codec parameters")));
     }
@@ -82,14 +78,14 @@ fn check_fast(id: &str, p: &FastParams) -> Result<(), IsaError> {
     Ok(())
 }
 
-fn support(b: &mut Builder) {
+pub(crate) fn support(b: &mut Builder) {
     b.block("support");
     b.scalar("one", 1.0);
     b.scalar("big", BIG);
 }
 
 /// `bytes_reg` (1 x positions byte values) to the code row `out` (1 x positions*code_dim).
-fn emit_encode(b: &mut Builder, p: &CodecParams, bytes_reg: &str, out: &str) {
+pub(crate) fn emit_encode(b: &mut Builder, p: &CodecParams, bytes_reg: &str, out: &str) {
     b.block("onehot");
     b.constant("byte_index", 1, p.code_rows, (0..p.code_rows).map(|i| i as f32).collect());
     b.op(Instr::Transpose { x: bytes_reg.into(), out: "enc_col".into() });
@@ -102,7 +98,7 @@ fn emit_encode(b: &mut Builder, p: &CodecParams, bytes_reg: &str, out: &str) {
 
 /// The code row `read` (1 x positions*code_dim) to `bytes` (1 x positions)
 /// and `margin` (1 x 1). Needs `one` and `big`.
-fn emit_decode(b: &mut Builder, p: &CodecParams, read: &str) {
+pub(crate) fn emit_decode(b: &mut Builder, p: &CodecParams, read: &str) {
     let pos = p.positions;
     b.block("decode");
     b.scalar("score_scale", 2.0);
@@ -139,7 +135,7 @@ fn emit_separate(b: &mut Builder, p: &FastParams) {
     b.gate(Mul, "winners", "amplitude", "sparse");
 }
 
-fn codec_io(b: &mut Builder, p: &CodecParams) {
+pub(crate) fn codec_io(b: &mut Builder, p: &CodecParams) {
     b.external("codes", p.code_rows, p.code_dim);
 }
 
@@ -150,26 +146,6 @@ pub fn compile_encode(id: &str, p: &CodecParams) -> Result<Compiled, IsaError> {
     codec_io(&mut b, p);
     emit_encode(&mut b, p, "value", "row");
     Ok(b.finish(&ENCODE_OUTPUTS))
-}
-
-pub fn compile_match(id: &str, p: &CodecParams) -> Result<Compiled, IsaError> {
-    check(id, p)?;
-    let mut b = Builder::new(id);
-    b.input("row", Some(1), p.positions * p.code_dim);
-    b.input("value", Some(1), p.positions);
-    codec_io(&mut b, p);
-    support(&mut b);
-    emit_decode(&mut b, p, "row");
-    // same = 1 iff max |bytes - value| < 1/2 (byte values are exact integers).
-    b.block("compare");
-    b.scalar("tolerance", 0.5);
-    b.gate(Sub, "bytes", "value", "diff_pos");
-    b.gate(Sub, "value", "bytes", "diff_neg");
-    b.gate(Max, "diff_pos", "diff_neg", "diff_abs");
-    b.reduce(ReduceFn::Max, "diff_abs", Axis::All, "diff_max");
-    b.gate(Ge, "diff_max", "tolerance", "differs");
-    b.gate(Sub, "one", "differs", "same");
-    Ok(b.finish(&MATCH_OUTPUTS))
 }
 
 pub fn compile_fast_recall(id: &str, p: &FastParams) -> Result<Compiled, IsaError> {

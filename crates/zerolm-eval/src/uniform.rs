@@ -133,18 +133,34 @@ fn memory_parity() -> Result<Parity, String> {
             *p.by_program.entry(id.into()).or_default() += 1;
         }
     }
-    // Value codec and W_FAST circuits: a short session of new facts, repeated
-    // facts (unchanged), contradicting facts, fast associations, and recalls.
+    // Write and W_FAST circuits: a short session of new facts, repeated facts
+    // (unchanged), contradicting facts, corrections, confirmations, a
+    // forgotten chain, history, compaction, fast associations, and recalls.
     let mut v = MemoryStore::new(MemoryConfig::default()).map_err(|e| e.to_string())?;
     v.value_circuits().record(true);
     let me = |e: zerolm_memory::MemoryError| e.to_string();
-    for i in 0..40 {
-        v.teach(&format!("item{i} colour"), &format!("shade{i}"), "uniform:value-codec").map_err(me)?;
+    let s = "uniform:memory-writes";
+    for i in 0..24 {
+        v.teach(&format!("item{i} colour"), &format!("shade{i}"), s).map_err(me)?;
     }
-    for i in 0..20 {
+    for i in 0..12 {
         let value = if i % 2 == 0 { format!("shade{i}") } else { format!("tint{i}") };
-        v.teach(&format!("item{i} colour"), &value, "uniform:value-codec").map_err(me)?;
+        v.teach(&format!("item{i} colour"), &value, s).map_err(me)?;
     }
+    for i in 12..18 {
+        v.correct(&format!("item{i} colour"), &format!("hue{i}"), s).map_err(me)?;
+    }
+    for i in 18..22 {
+        v.confirm(&format!("item{i} colour"), s).map_err(me)?;
+    }
+    v.confirm("never taught key", s).map_err(me)?;
+    v.correct("item12 colour", "hue12b", s).map_err(me)?;
+    v.forget("item12 colour", s).map_err(me)?;
+    v.forget("item13 colour", s).map_err(me)?;
+    v.forget("never taught key", s).map_err(me)?;
+    v.history("item14 colour").map_err(me)?;
+    v.compact(s);
+    v.teach("after compaction", "fresh", s).map_err(me)?;
     for i in 0..4 {
         v.associate_fast(&format!("door{i} code"), &format!("code{i}"), "uniform:value-codec").map_err(me)?;
     }

@@ -76,7 +76,7 @@ The header is `{"program": <Program>, "tensors": [{"name", "rows", "cols"}, ...]
 |---|---|
 | circuits pinned and reproducible | every spec in `model/prog/` compiles twice to the same SHA-256, equal to `model/prog/pinned.json` |
 | patch round trip | for every circuit: a one-value patch applies, a second apply is refused, and revert restores the original hash |
-| memory reference parity | 400 memory queries (taught keys and unknown keys) through `memory-encode` and `memory-read`, plus a short session of new, repeated, and contradicting facts and fast associations through `value-encode`, `value-match`, `fast-write` (including its final `memory.fast` state), and `fast-recall`: 868 runs, reproduced bit for bit from the exported bundles |
+| memory reference parity | 400 memory queries (taught keys and unknown keys) through `memory-encode` and `memory-read`, plus a short session of new, repeated, contradicting, corrected, confirmed, and forgotten facts, history, compaction, and fast associations through the write circuits, `fast-write` (including its final `memory.fast` state), and `fast-recall`: every run reproduced bit for bit from the exported bundles |
 | reasoning reference parity | every circuit run while a generated world is taught and its questions answered, intact and with each operator ablated, replayed on the reference interpreter (3,520 runs, all bit-exact; every decision circuit included) |
 | host audit | the model-path files listed in `model/prog/host-audit.json` contain no text processing; host code that still makes content decisions is listed as **pending** |
 
@@ -95,14 +95,22 @@ Two different names collide only if all three hashes collide (probability about 
 
 ## The value codec and W_FAST circuits
 
-`model/prog/value-encode.json`, `value-match.json`, `fast-recall.json`, `fast-write.json`, compiled by `zerolm_wsp::circuits::value_codec`; they replace the host value encoder, the host nearest-code decoder, and the host fast-weight code (`retrieval.rs` and `fast_weights.rs` are deleted). Bound tensors: the byte code table $E$ (`core.embed`, 256 x 16), the separator $P$ (`core.fast_separator`), and `memory.fast` (a weight for recall, the `delta_write` state for writes).
+`model/prog/value-encode.json`, `fast-recall.json`, `fast-write.json`, compiled by `zerolm_wsp::circuits::value_codec`; they replace the host value encoder, the host nearest-code decoder, and the host fast-weight code (`retrieval.rs` and `fast_weights.rs` are deleted). Bound tensors: the byte code table $E$ (`core.embed`, 256 x 16), the separator $P$ (`core.fast_separator`), and `memory.fast` (a weight for recall, the `delta_write` state for writes).
 
 - `value-encode`: value bytes (NUL-padded to 48) compared with the indices 0..255 (`ge` both ways) give a one-hot $O$; the row is $OE$, reshaped to 1 x 768.
-- `value-match`: nearest-code decoding of a stored row (the `memory-read` cleanup: $\arg\max_b 2x\cdot E_b - \lVert E_b\rVert^2$, bytes after the first NUL zeroed, top-1 minus top-2 margin), then `same` $= 1 - [\max_p |\hat b_p - b_p| \ge 1/2]$.
 - `fast-recall`: $\sigma(k) = \mathrm{topk}_{32}(Pk) / \sqrt{32}$, the read $M\sigma$, and the same decoding.
 - `fast-write`: the same $\sigma$, the value encoded as in `value-encode`, then `delta_write` with learning rate 0 and decay 0.99 (decay only), and `delta_write` with learning rate 1, epsilon $10^{-6}$ and decay 1 (the delta rule on the decayed matrix).
 
-The host copies bytes into input rows and branches only on the circuits' outputs (`same`, the decoded bytes); those branches are memory write bookkeeping, still listed as pending.
+`value-encode` remains a standalone pinned program (the write circuits encode values in-circuit with the same block). The nearest-code decoding and the byte comparison that tell an unchanged fact from a contradiction are part of `memory-write` (below).
+
+## The memory write circuits
+
+`model/prog/memory-{write,forget,compact,history}.json`, compiled by `zerolm_wsp::circuits::memory_write`. They decide every change to the semantic and episodic memory; the host stamps a write with what it owns (sequence number, source, provenance, key word count), refuses a write past capacity, and moves the rows the outputs specify.
+
+- `memory-write` (teach, correct, confirm; a one-hot `op`): the same-key slot is the best active key with $k \cdot K_s \ge 0.95$; its value row is decoded (nearest code) and compared byte by byte with the new value; the free slot is the lowest empty one (`topk`, ties to the lowest index). The outcome is one-hot: teach gives unchanged, conflict, or stored; correct gives unchanged, superseded, or stored; confirm gives confirmed or unknown. Outputs: the new slot's key, key-word, value (encoded in-circuit), and metadata rows (zero unless a slot is written; a superseding record links to the old slot), the old slot's metadata after the operation (contradictions + 1, or status superseded with a forward link, or confidence confirmed, and the updated time), and the episode row (op code and slot).
+- `memory-forget`: the same-key slot, then one supersession link per step for as many steps as there are slots (any chain is followed; visited slots are not revisited), the valid episodic records that refer to the chain (their keys are erased), and the metadata with the chain marked deleted.
+- `memory-compact`: active slots first in index order (`topk` with $k = S$), a permutation matrix $P$ (row $j$ holds old slot $\mathrm{order}_j$), the map old $\to$ new ($-1$ for reclaimed slots), and every supersession link and episodic slot reference remapped through it; rows past the active ones become empty records.
+- `memory-history`: valid episodes whose key has $k \cdot e \ge 0.95$ with the query key.
 
 ## The reasoner write circuits
 

@@ -101,7 +101,7 @@ A value of bytes $v_1..v_m$ ($m \le 47$) is stored as 48 code rows, $V = [E[v_1]
 
 $$\hat b = \arg\min_b \lVert x - E_b\rVert^2 = \arg\max_b \big(2\langle x, E_b\rangle - \lVert E_b\rVert^2\big)$$
 
-The two forms are equal because $\lVert x\rVert^2$ does not depend on $b$; the circuit uses the second, a matmul plus a bias. Decoding stops at the first $\hat b = 0$ (NUL). The **margin** is the smallest gap, over decoded positions, between the best and second-best score: how far the read is from flipping a byte. Values are written by the `value-encode` circuit (byte one-hot times $E$), and at write time the `value-match` circuit decodes a stored row this way and compares it byte by byte with the new value, which tells an unchanged fact from a contradiction.
+The two forms are equal because $\lVert x\rVert^2$ does not depend on $b$; the circuit uses the second, a matmul plus a bias. Decoding stops at the first $\hat b = 0$ (NUL). The **margin** is the smallest gap, over decoded positions, between the best and second-best score: how far the read is from flipping a byte. Values are encoded in-circuit (byte one-hot times $E$), and at write time the `memory-write` circuit decodes the same-key slot's row this way and compares it byte by byte with the new value, which tells an unchanged fact from a contradiction.
 
 ### Accept rule
 
@@ -109,7 +109,7 @@ $$\text{answer} \iff s_{\text{best}} \ge 0.3 \;\wedge\; \text{cov} \ge 0.5 \;\we
 
 In the circuit this is the product of four $\{0, 1\}$ gates, multiplied into the decoded bytes, so a rejected read outputs an empty value.
 
-**Writes** address an existing slot when $s_{\text{best}} \ge 0.95$ (same fact key). That uses the circuit's `best` and `score` outputs, queried with the write key as its only word.
+**Writes** address an existing slot when $s_{\text{best}} = \max_{s\ \text{active}} k \cdot K_s \ge 0.95$ (same fact key). Every write decision (teach, correct, confirm, forget, compaction) is made by the compiled write circuits (`memory-write`, `memory-forget`, `memory-compact`; see `docs/neural-isa.md`); the host stamps sequence and provenance, refuses writes past capacity, and moves the rows the circuits specify.
 
 ### Fast weights: sparse keys and the delta rule (`fast-write`, `fast-recall`)
 

@@ -24,6 +24,7 @@ use zerolm_engine::isa::Buf;
 use zerolm_engine::Model;
 use zerolm_tensor::sha256::Sha256;
 use zerolm_tensor::{fnv1a, shuffle, Matrix};
+use zerolm_wsp::circuits::memory_write::OUTCOMES;
 use zerolm_wsp::Compiled;
 
 pub const KEYS: &str = "memory.semantic.keys";
@@ -488,24 +489,6 @@ impl MemoryStore {
         view(&self.core.embed)
     }
 
-    /// Code row of a value, computed by the `value-encode` circuit.
-    fn encode_value(&self, value: &str) -> Vec<f32> {
-        self.codec.encode_value(self.codes(), value)
-    }
-
-    /// Whether a slot holds exactly `value` (the `value-match` circuit decodes
-    /// the stored row and compares it; used for write-time comparison).
-    fn holds_value(&self, slot: usize, value: &str) -> bool {
-        self.codec.matches(self.codes(), self.values.row(slot), value).1
-    }
-
-    /// Active slot whose key is the same fact key: the read circuit's best
-    /// slot when its score reaches `same_key_threshold`.
-    fn find_same(&self, k: &[f32]) -> Option<usize> {
-        let a = self.answer(read_circuit::key_inputs(k));
-        a.slot.filter(|_| a.score >= self.cfg.same_key_threshold)
-    }
-
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
@@ -562,67 +545,110 @@ impl MemoryStore {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write_slot(&mut self, slot: usize, k: &[f32], words: &[f32], n_words: usize, value: &str, source: Source, stream: &str, seq: u64) {
-        let v = self.encode_value(value);
-        let kc = self.keys.cols;
-        self.keys.data[slot * kc..(slot + 1) * kc].copy_from_slice(k);
-        let wc = self.key_words.cols;
-        self.key_words.data[slot * wc..(slot + 1) * wc].copy_from_slice(words);
-        self.set(slot, field::KEY_WORDS, n_words as f32);
-        let vc = self.values.cols;
-        self.values.data[slot * vc..(slot + 1) * vc].copy_from_slice(&v);
+    /// The metadata a write at `seq` is stamped with (what the host owns:
+    /// sequence, source, provenance, key word count); the circuit adds status,
+    /// confidence, and links.
+    fn stamp(seq: u64, source: Source, stream: &str, n_words: usize) -> Vec<f32> {
         let (lo, hi) = split48(seq);
-        let p = prov(stream);
-        self.set(slot, field::STATUS, ACTIVE);
-        self.set(slot, field::CONFIDENCE, UNCONFIRMED);
-        self.set(slot, field::CREATED_LO, lo);
-        self.set(slot, field::CREATED_HI, hi);
-        self.set(slot, field::UPDATED_LO, lo);
-        self.set(slot, field::UPDATED_HI, hi);
-        self.set(slot, field::SOURCE, source as u8 as f32);
-        for (i, x) in p.iter().enumerate() {
-            self.set(slot, field::PROV + i, *x);
+        let mut s = vec![0.0f32; field::COUNT];
+        s[field::CREATED_LO] = lo;
+        s[field::CREATED_HI] = hi;
+        s[field::UPDATED_LO] = lo;
+        s[field::UPDATED_HI] = hi;
+        s[field::SOURCE] = source as u8 as f32;
+        s[field::PROV..field::PROV + 3].copy_from_slice(&prov(stream));
+        s[field::KEY_WORDS] = n_words as f32;
+        s
+    }
+
+    /// The episodic stamp of an operation at `seq`; the circuit adds the op and slot.
+    fn ep_stamp(seq: u64, source: Source, stream: &str) -> Vec<f32> {
+        let (lo, hi) = split48(seq);
+        let mut r = vec![0.0f32; ep_field::COUNT];
+        r[ep_field::SEQ_LO] = lo;
+        r[ep_field::SEQ_HI] = hi;
+        r[ep_field::SOURCE] = source as u8 as f32;
+        r[ep_field::PROV..ep_field::PROV + 3].copy_from_slice(&prov(stream));
+        r[ep_field::VALID] = 1.0;
+        r
+    }
+
+    /// Append an episode row computed by a circuit (ring buffer).
+    fn push_episode(&mut self, key: Option<&[f32]>, row: &[f32]) -> usize {
+        let r = (self.ep_count % self.cfg.episodic_capacity as u64) as usize;
+        self.ep_count += 1;
+        let c = self.ep_keys.cols;
+        match key {
+            Some(k) => self.ep_keys.data[r * c..(r + 1) * c].copy_from_slice(k),
+            None => self.ep_keys.data[r * c..(r + 1) * c].iter_mut().for_each(|x| *x = 0.0),
         }
-        self.set(slot, field::SUPERSEDES, -1.0);
-        self.set(slot, field::SUPERSEDED_BY, -1.0);
-        self.set(slot, field::CONTRADICTIONS, 0.0);
+        self.ep_meta.data[r * ep_field::COUNT..(r + 1) * ep_field::COUNT].copy_from_slice(row);
+        r
     }
 
-    fn touch(&mut self, slot: usize, seq: u64) {
-        let (lo, hi) = split48(seq);
-        self.set(slot, field::UPDATED_LO, lo);
-        self.set(slot, field::UPDATED_HI, hi);
+    fn put_row(m: &mut Matrix, r: usize, row: &[f32]) {
+        let c = m.cols;
+        m.data[r * c..(r + 1) * c].copy_from_slice(row);
     }
 
-    fn free_slot(&self) -> Option<usize> {
-        (0..self.cfg.slots).find(|&i| self.status(i) == EMPTY)
+    /// teach (0), correct (1), or confirm (2): the `memory-write` circuit
+    /// decides the outcome and computes every row that changes; the host
+    /// checks capacity, moves those rows, and logs.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_write(&mut self, op: usize, k: &[f32], words: &[f32], n_words: usize, value: &str, src: Source, stream: &str) -> Result<Outcome, MemoryError> {
+        let seq = self.clock + 1;
+        let mut op_row = vec![0.0f32; 3];
+        op_row[op] = 1.0;
+        let inputs = vec![
+            ("key", Buf::row(k.to_vec())),
+            ("words", Buf::row(words.to_vec())),
+            ("value", self.codec.value_input(value)),
+            ("op", Buf::row(op_row)),
+            ("stamp", Buf::row(Self::stamp(seq, src, stream, n_words))),
+            ("ep_stamp", Buf::row(Self::ep_stamp(seq, src, stream))),
+        ];
+        let o = self.codec.decide(
+            &self.codec.mem_write,
+            inputs,
+            &[("keys", view(&self.keys)), ("values", view(&self.values)), ("meta", view(&self.meta)), ("codes", view(&self.core.embed))],
+        );
+        let outcome = OUTCOMES[o.get("outcome").data.iter().position(|&x| x == 1.0).expect("one-hot outcome")];
+        if outcome == "unknown" {
+            return Ok(Outcome::Unknown);
+        }
+        let writes_new = matches!(outcome, "stored" | "superseded");
+        if writes_new && o.scalar("full") == 1.0 {
+            return Err(MemoryError::CapacityFull);
+        }
+        self.tick();
+        let (best, free) = (o.scalar("best") as usize, o.scalar("free") as usize);
+        if writes_new {
+            Self::put_row(&mut self.keys, free, &o.get("new_key").data);
+            Self::put_row(&mut self.key_words, free, &o.get("new_words").data);
+            Self::put_row(&mut self.values, free, &o.get("new_value").data);
+            Self::put_row(&mut self.meta, free, &o.get("new_meta").data);
+        }
+        if outcome != "stored" {
+            Self::put_row(&mut self.meta, best, &o.get("old_meta").data);
+        }
+        let r = self.push_episode(Some(k), &o.get("episode").data);
+        let all = vec![KEYS, KEY_WORDS, VALUES, META, EP_KEYS, EP_META];
+        let (name, changed, slot, out) = match outcome {
+            "stored" => ("add", all, Some(free), Outcome::Stored { slot: free }),
+            "unchanged" => ("unchanged", vec![EP_KEYS, EP_META], None, Outcome::Unchanged { slot: best }),
+            "conflict" => ("contradiction", vec![META, EP_KEYS, EP_META], Some(best), Outcome::Conflict { slot: best }),
+            "superseded" => ("supersede", all, Some(free), Outcome::Superseded { old: best, new: free }),
+            _ => ("confirm", vec![META, EP_KEYS, EP_META], Some(best), Outcome::Confirmed { slot: best }),
+        };
+        self.log(seq, name, stream, src.signal(), "memory_write", changed, slot, Some(r));
+        Ok(out)
     }
 
     /// `teach`: store a new fact; never overwrites a different belief.
     pub fn teach(&mut self, key: &str, value: &str, stream: &str) -> Result<Outcome, MemoryError> {
         let (k, words, n_words) = self.key(key)?;
         self.check_value(value)?;
-        let src = Source::UserStatement;
-        if let Some(s) = self.find_same(&k) {
-            let seq = self.tick();
-            if self.holds_value(s, value) {
-                let r = self.episode("unchanged", seq, Some(&k), Some(s), Some(src), stream);
-                self.log(seq, "unchanged", stream, src.signal(), "memory_write", vec![EP_KEYS, EP_META], None, Some(r));
-                return Ok(Outcome::Unchanged { slot: s });
-            }
-            let c = self.m(s, field::CONTRADICTIONS) + 1.0;
-            self.set(s, field::CONTRADICTIONS, c);
-            let r = self.episode("contradiction", seq, Some(&k), Some(s), Some(src), stream);
-            self.log(seq, "contradiction", stream, src.signal(), "memory_write", vec![META, EP_KEYS, EP_META], Some(s), Some(r));
-            return Ok(Outcome::Conflict { slot: s });
-        }
-        let slot = self.free_slot().ok_or(MemoryError::CapacityFull)?;
-        let seq = self.tick();
-        self.write_slot(slot, &k, &words, n_words, value, src, stream, seq);
-        let r = self.episode("add", seq, Some(&k), Some(slot), Some(src), stream);
-        self.log(seq, "add", stream, src.signal(), "memory_write", vec![KEYS, KEY_WORDS, VALUES, META, EP_KEYS, EP_META], Some(slot), Some(r));
-        Ok(Outcome::Stored { slot })
+        self.apply_write(0, &k, &words, n_words, value, Source::UserStatement, stream)
     }
 
     /// `correct`: the new value supersedes the current belief (kept, marked
@@ -630,89 +656,50 @@ impl MemoryStore {
     pub fn correct(&mut self, key: &str, value: &str, stream: &str) -> Result<Outcome, MemoryError> {
         let (k, words, n_words) = self.key(key)?;
         self.check_value(value)?;
-        let src = Source::UserCorrection;
-        let old = self.find_same(&k);
-        if let Some(s) = old {
-            if self.holds_value(s, value) {
-                let seq = self.tick();
-                let r = self.episode("unchanged", seq, Some(&k), Some(s), Some(src), stream);
-                self.log(seq, "unchanged", stream, src.signal(), "memory_write", vec![EP_KEYS, EP_META], None, Some(r));
-                return Ok(Outcome::Unchanged { slot: s });
-            }
-        }
-        let slot = self.free_slot().ok_or(MemoryError::CapacityFull)?;
-        let seq = self.tick();
-        self.write_slot(slot, &k, &words, n_words, value, src, stream, seq);
-        match old {
-            Some(s) => {
-                self.set(s, field::STATUS, SUPERSEDED);
-                self.set(s, field::SUPERSEDED_BY, slot as f32);
-                self.touch(s, seq);
-                self.set(slot, field::SUPERSEDES, s as f32);
-                let r = self.episode("supersede", seq, Some(&k), Some(slot), Some(src), stream);
-                self.log(seq, "supersede", stream, src.signal(), "memory_write", vec![KEYS, KEY_WORDS, VALUES, META, EP_KEYS, EP_META], Some(slot), Some(r));
-                Ok(Outcome::Superseded { old: s, new: slot })
-            }
-            None => {
-                let r = self.episode("add", seq, Some(&k), Some(slot), Some(src), stream);
-                self.log(seq, "add", stream, src.signal(), "memory_write", vec![KEYS, KEY_WORDS, VALUES, META, EP_KEYS, EP_META], Some(slot), Some(r));
-                Ok(Outcome::Stored { slot })
-            }
-        }
+        self.apply_write(1, &k, &words, n_words, value, Source::UserCorrection, stream)
     }
 
     /// `confirm`: raise the stored belief's confidence to 1.
     pub fn confirm(&mut self, key: &str, stream: &str) -> Result<Outcome, MemoryError> {
         let k = self.pooled(key)?;
-        let Some(s) = self.find_same(&k) else { return Ok(Outcome::Unknown) };
-        let seq = self.tick();
-        self.set(s, field::CONFIDENCE, CONFIRMED);
-        self.touch(s, seq);
-        let src = Source::UserCorrection;
-        let r = self.episode("confirm", seq, Some(&k), Some(s), Some(src), stream);
-        self.log(seq, "confirm", stream, src.signal(), "memory_write", vec![META, EP_KEYS, EP_META], Some(s), Some(r));
-        Ok(Outcome::Confirmed { slot: s })
+        let words = vec![0.0f32; self.key_words.cols];
+        self.apply_write(2, &k, &words, 0, "", Source::UserCorrection, stream)
     }
 
-    /// `forget`: delete the belief and every value it superseded. Key and
-    /// value rows are zeroed (erased, not hidden); the episodic records that
-    /// carry this key lose their key vector. Metadata keeps status=deleted.
+    /// `forget`: delete the belief and every value it superseded (the
+    /// `memory-forget` circuit follows the links). Key and value rows are
+    /// zeroed (erased, not hidden); the episodic records that carry this key
+    /// lose their key vector. Metadata keeps status=deleted.
     pub fn forget(&mut self, key: &str, stream: &str) -> Result<Outcome, MemoryError> {
         let k = self.pooled(key)?;
-        let Some(s) = self.find_same(&k) else { return Ok(Outcome::Unknown) };
-        let seq = self.tick();
-        let mut chain = vec![s];
-        let mut cur = s;
-        while let Some(p) = slot_ref(self.m(cur, field::SUPERSEDES)) {
-            if chain.contains(&p) {
-                break;
-            }
-            chain.push(p);
-            cur = p;
-        }
-        for &c in &chain {
-            let (kc, vc, wc) = (self.keys.cols, self.values.cols, self.key_words.cols);
-            self.keys.data[c * kc..(c + 1) * kc].iter_mut().for_each(|x| *x = 0.0);
-            self.key_words.data[c * wc..(c + 1) * wc].iter_mut().for_each(|x| *x = 0.0);
-            self.values.data[c * vc..(c + 1) * vc].iter_mut().for_each(|x| *x = 0.0);
-            self.set(c, field::STATUS, DELETED);
-            self.touch(c, seq);
-        }
-        for r in 0..self.cfg.episodic_capacity {
-            let row = r * ep_field::COUNT;
-            if self.ep_meta.data[row + ep_field::VALID] == 1.0 {
-                if let Some(es) = slot_ref(self.ep_meta.data[row + ep_field::SLOT]) {
-                    if chain.contains(&es) {
-                        let c = self.ep_keys.cols;
-                        self.ep_keys.data[r * c..(r + 1) * c].iter_mut().for_each(|x| *x = 0.0);
-                    }
-                }
-            }
-        }
+        let seq = self.clock + 1;
         let src = Source::UserCorrection;
-        let r = self.episode("forget", seq, None, Some(s), Some(src), stream);
+        let (lo, hi) = split48(seq);
+        let mut stamp = vec![0.0f32; field::COUNT];
+        stamp[field::UPDATED_LO] = lo;
+        stamp[field::UPDATED_HI] = hi;
+        let inputs = vec![("key", Buf::row(k)), ("stamp", Buf::row(stamp)), ("ep_stamp", Buf::row(Self::ep_stamp(seq, src, stream)))];
+        let o = self.codec.decide(&self.codec.forget, inputs, &[("keys", view(&self.keys)), ("meta", view(&self.meta)), ("ep_meta", view(&self.ep_meta))]);
+        if o.scalar("found") != 1.0 {
+            return Ok(Outcome::Unknown);
+        }
+        self.tick();
+        let marked = |b: &Buf| b.data.iter().enumerate().filter(|(_, &x)| x > 0.0).map(|(i, _)| i).collect::<Vec<usize>>();
+        let chain = marked(o.get("chain"));
+        for &c in &chain {
+            for m in [&mut self.keys, &mut self.key_words, &mut self.values] {
+                let w = m.cols;
+                m.data[c * w..(c + 1) * w].iter_mut().for_each(|x| *x = 0.0);
+            }
+        }
+        self.meta.data.copy_from_slice(&o.get("meta_out").data);
+        for r in marked(o.get("erase")) {
+            let c = self.ep_keys.cols;
+            self.ep_keys.data[r * c..(r + 1) * c].iter_mut().for_each(|x| *x = 0.0);
+        }
+        let s = o.scalar("slot") as usize;
+        let r = self.push_episode(None, &o.get("episode").data);
         self.log(seq, "forget", stream, src.signal(), "memory_write", vec![KEYS, KEY_WORDS, VALUES, META, EP_KEYS, EP_META], Some(s), Some(r));
-        chain.sort_unstable();
         Ok(Outcome::Forgotten { slots: chain })
     }
 
@@ -795,61 +782,45 @@ impl MemoryStore {
     /// Episodic records whose key is this fact key, oldest first.
     pub fn history(&self, text: &str) -> Result<Vec<Episode>, MemoryError> {
         let q = self.pooled(text)?;
-        let mut out = Vec::new();
-        for r in 0..self.cfg.episodic_capacity {
-            let m = self.ep_meta.row(r);
-            if m[ep_field::VALID] == 1.0 && zerolm_tensor::dot(self.ep_keys.row(r), &q) >= self.cfg.same_key_threshold {
-                out.push(Episode {
-                    seq: join48(m[ep_field::SEQ_LO], m[ep_field::SEQ_HI]),
-                    op: OPS[m[ep_field::OP] as usize],
-                    slot: slot_ref(m[ep_field::SLOT]),
-                });
-            }
-        }
+        let o = self.codec.decide(&self.codec.history, vec![("key", Buf::row(q))], &[("ep_keys", view(&self.ep_keys)), ("ep_meta", view(&self.ep_meta))]);
+        let mut out: Vec<Episode> = o
+            .get("hits")
+            .data
+            .iter()
+            .enumerate()
+            .filter(|(_, &h)| h == 1.0)
+            .map(|(r, _)| {
+                let m = self.ep_meta.row(r);
+                Episode { seq: join48(m[ep_field::SEQ_LO], m[ep_field::SEQ_HI]), op: OPS[m[ep_field::OP] as usize], slot: slot_ref(m[ep_field::SLOT]) }
+            })
+            .collect();
         out.sort_by_key(|e| e.seq);
         Ok(out)
     }
 
-    /// Reclaim superseded and deleted slots. Active facts are moved to the
-    /// lowest slots in order; supersession links and episodic slot references
-    /// to reclaimed slots become -1. Returns the number of slots freed.
+    /// Reclaim superseded and deleted slots. The `memory-compact` circuit
+    /// orders active facts to the lowest slots and remaps supersession links
+    /// and episodic slot references (-1 for reclaimed slots); the host moves
+    /// the rows in that order. Returns the number of slots freed.
     pub fn compact(&mut self, stream: &str) -> usize {
-        let active = self.active_slots();
-        let freed = self.cfg.slots - active.len() - self.stats().free;
-        let mut map = vec![-1.0f32; self.cfg.slots];
-        for (new, &old) in active.iter().enumerate() {
-            map[old] = new as f32;
+        let o = self.codec.decide(&self.codec.compact, Vec::new(), &[("meta", view(&self.meta)), ("ep_meta", view(&self.ep_meta))]);
+        let n = o.scalar("n_active") as usize;
+        let order: Vec<usize> = o.get("order").data[..n].iter().map(|&x| x as usize).collect();
+        for m in [&mut self.keys, &mut self.key_words, &mut self.values] {
+            let mut moved = Matrix::zeros(m.rows, m.cols);
+            for (new, &old) in order.iter().enumerate() {
+                moved.data[new * m.cols..(new + 1) * m.cols].copy_from_slice(m.row(old));
+            }
+            *m = moved;
         }
-        let remap = |x: f32| if x < 0.0 { -1.0 } else { map[x as usize] };
-        let (kc, vc, mc, wc) = (self.keys.cols, self.values.cols, field::COUNT, self.key_words.cols);
-        let mut keys = Matrix::zeros(self.cfg.slots, kc);
-        let mut key_words = Matrix::zeros(self.cfg.slots, wc);
-        let mut values = Matrix::zeros(self.cfg.slots, vc);
-        let mut meta = Matrix::zeros(self.cfg.slots, mc);
-        for r in 0..self.cfg.slots {
-            meta.data[r * mc + field::SUPERSEDES] = -1.0;
-            meta.data[r * mc + field::SUPERSEDED_BY] = -1.0;
+        self.meta.data.copy_from_slice(&o.get("meta_out").data);
+        for (r, &s) in o.get("ep_slot").data.iter().enumerate() {
+            self.ep_meta.data[r * ep_field::COUNT + ep_field::SLOT] = s;
         }
-        for (new, &old) in active.iter().enumerate() {
-            keys.data[new * kc..(new + 1) * kc].copy_from_slice(self.keys.row(old));
-            key_words.data[new * wc..(new + 1) * wc].copy_from_slice(self.key_words.row(old));
-            values.data[new * vc..(new + 1) * vc].copy_from_slice(self.values.row(old));
-            meta.data[new * mc..(new + 1) * mc].copy_from_slice(self.meta.row(old));
-            meta.data[new * mc + field::SUPERSEDES] = remap(self.m(old, field::SUPERSEDES));
-            meta.data[new * mc + field::SUPERSEDED_BY] = remap(self.m(old, field::SUPERSEDED_BY));
-        }
-        for r in 0..self.cfg.episodic_capacity {
-            let i = r * ep_field::COUNT + ep_field::SLOT;
-            self.ep_meta.data[i] = remap(self.ep_meta.data[i]);
-        }
-        self.keys = keys;
-        self.key_words = key_words;
-        self.values = values;
-        self.meta = meta;
         let seq = self.tick();
         let r = self.episode("compact", seq, None, None, None, stream);
         self.log(seq, "compact", stream, "memory_maintenance", "compaction", vec![KEYS, KEY_WORDS, VALUES, META, EP_META], None, Some(r));
-        freed
+        o.scalar("freed") as usize
     }
 
     /// `W_FAST` write: a short-lived association (not a semantic belief).
@@ -929,7 +900,7 @@ impl MemoryStore {
 
     /// Every tensor of the checkpoint, with its weight group.
     pub fn tensors(&self) -> Vec<Tensor> {
-        let mut t = Self::core_tensors(&self.core, &self.encoder, &self.separator, &[&self.encode, &self.read, &self.codec.encode, &self.codec.matcher, &self.codec.recall, &self.codec.write]);
+        let mut t = Self::core_tensors(&self.core, &self.encoder, &self.separator, &[&[&self.encode, &self.read][..], &self.codec.all()[..]].concat());
         let mat = |name: &str, group: &str, m: &Matrix| Tensor::new(name, group, m.rows, m.cols, m.data.clone());
         t.push(mat(KEYS, "memory_keys", &self.keys));
         t.push(mat(KEY_WORDS, "memory_keys", &self.key_words));
