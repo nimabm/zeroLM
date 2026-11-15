@@ -70,14 +70,14 @@ The header is `{"program": <Program>, "tensors": [{"name", "rows", "cols"}, ...]
 
 ## The uniform-engine gate
 
-`cargo run --release -p zerolm-eval --bin zerolm-uniform` (about 2 minutes; report schema `research/schemas/uniform-engine-report.schema.json`):
+`cargo run --release -p zerolm-eval --bin zerolm-uniform` (about 4 minutes; report schema `research/schemas/uniform-engine-report.schema.json`):
 
 | Check | What it shows |
 |---|---|
 | circuits pinned and reproducible | every spec in `model/prog/` compiles twice to the same SHA-256, equal to `model/prog/pinned.json` |
 | patch round trip | for every circuit: a one-value patch applies, a second apply is refused, and revert restores the original hash |
 | memory reference parity | 400 memory queries (taught keys and unknown keys) through `memory-encode` and `memory-read`, plus a short session of new, repeated, and contradicting facts and fast associations through `value-encode`, `value-match`, `fast-write` (including its final `memory.fast` state), and `fast-recall`: 868 runs, reproduced bit for bit from the exported bundles |
-| reasoning reference parity | every circuit run while a generated world is taught and its questions answered, intact and with each operator ablated, replayed on the reference interpreter (7,783 runs, all bit-exact) |
+| reasoning reference parity | every circuit run while a generated world is taught and its questions answered, intact and with each operator ablated, replayed on the reference interpreter (3,520 runs, all bit-exact; every decision circuit included) |
 | host audit | the model-path files listed in `model/prog/host-audit.json` contain no text processing; host code that still makes content decisions is listed as **pending** |
 
 The gate passes when every check holds. The milestone counts as complete only when the pending list is also empty, which means all model behavior is in weights.
@@ -112,6 +112,20 @@ The host copies bytes into input rows and branches only on the circuits' outputs
 - `symbol-cleanup`: input $v$ and a one-hot `mode`. Cosines $c_i = C_i \cdot \hat v / \sqrt d$ with every codebook row, the best row, and `found` when $c \ge$ the mode's threshold: 0.3 (cleanup of an unbound filler), 0.9 (the same symbol, for interning and lookups), or 0.4 (resolving "it" from the discourse state; a zero state has cosine 0 and never resolves).
 
 The retrieval ablation binds zero metadata (no slot is active); the binding ablation binds identity role phasors.
+
+## The decision circuits
+
+Compiled by `zerolm_wsp::circuits::decide` (`model/prog/relation-{join,levels,rules,counts,verdict}.json`). They replace the operators' Rust control flow: each is a fixed number of steps over the C5 outputs (`subj_sim`, `obj_t`, `pos`, `neg`), with $E_r[s, i] = [\mathrm{subj\_sim}[s,i] + \mathrm{sim}(\text{slot}_s, r \circledast \rho_{\text{rel}}) \ge 1.5] \cdot \mathrm{pol}[s]$ the r-edges leaving symbol i. Proofs are slot masks or premise matrices (row j = slots on the proof of j); among candidates the shortest proof wins (score $10^6 - 1 - \text{length}$, ties to the lowest slot).
+
+| circuit | operator | computation |
+|---|---|---|
+| `relation-join` | negation | the shortest negative r-edge from $\{x\} \cup$ anc(x) to $\{y\} \cup$ anc(y) (ancestors and their premise matrices from two C6 runs; with class inclusion disabled, only x and y) |
+| `relation-levels` | attribute inheritance | breadth-first levels over positive isa edges; at the first level whose frontier has a positive or negative can-edge to v, both are latched ($\mathrm{done} \leftarrow \max(\mathrm{done}, \mathrm{found})$) |
+| `relation-rules` | conditionals | backward levels from property p over in-scope rules (scope "something" or x, cosine $\ge 0.3$), latched at the first level where x has a frontier property directly |
+| `relation-counts` | arithmetic | breadth-first over "more" edges carrying $\mathrm{num}(\sum \delta)$ by binding cleaned differences; each reached node's count is cleaned up, bound to its carried sum, and decoded; one distinct value is the answer, several are a contradiction |
+| `relation-verdict` | combination | $(p, n) \mapsto$ yes $p\bar n$, no $\bar p n$, contradiction $pn$, unknown $\bar p \bar n$, and the union of the supporting proofs |
+
+Each operator's enable constant is its own block, so zeroing it is the operator ablation. The host chooses which circuits a question's parsed form runs and labels the result from proof lengths and levels; it makes no content decision.
 
 ## The number circuits
 

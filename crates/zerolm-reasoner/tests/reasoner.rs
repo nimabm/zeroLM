@@ -178,6 +178,11 @@ fn default_config_compiles_to_the_shipped_pinned_circuits() {
         (number_decode_spec(&cfg), NUMBER_DECODE_ID),
         (probe_spec(&cfg), PROBE_ID),
         (cleanup_spec(&cfg), CLEANUP_ID),
+        (decide_spec(&cfg, JOIN_ID), JOIN_ID),
+        (decide_spec(&cfg, LEVELS_ID), LEVELS_ID),
+        (decide_spec(&cfg, RULES_ID), RULES_ID),
+        (decide_spec(&cfg, COUNTS_ID), COUNTS_ID),
+        (decide_spec(&cfg, VERDICT_ID), VERDICT_ID),
     ] {
         let built = zerolm_wsp::compile(&spec).unwrap();
         assert_eq!(built.sha256(), zerolm_wsp::shipped(id).unwrap().sha256(), "{id}: ReasonerConfig::default() must compile to model/prog/{id}.json");

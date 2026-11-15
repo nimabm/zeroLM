@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use zerolm_engine::binding::{Hv, Space};
 use zerolm_engine::isa::{self, bundle, Bindings, Buf, Outputs, View};
 use zerolm_wsp::circuits::atom_encode::Params as AtomParams;
+use zerolm_wsp::circuits::decide::CountParams;
 use zerolm_wsp::circuits::probe::{CleanupParams, ProbeParams};
 use zerolm_wsp::circuits::number::{DecodeParams as NumberDecodeParams, EncodeParams as NumberEncodeParams};
 use zerolm_wsp::circuits::relational::{Params, OPERATORS};
@@ -37,6 +38,26 @@ pub fn graph_spec(cfg: &ReasonerConfig) -> Spec {
 
 pub fn reach_spec(cfg: &ReasonerConfig) -> Spec {
     Spec { id: REACH_ID.into(), version: 1, seed_entry: "relation-reach-circuit".into(), description: String::new(), circuit: Circuit::RelationReach(params(cfg)) }
+}
+
+pub const JOIN_ID: &str = "relation-join";
+pub const LEVELS_ID: &str = "relation-levels";
+pub const RULES_ID: &str = "relation-rules";
+pub const COUNTS_ID: &str = "relation-counts";
+pub const VERDICT_ID: &str = "relation-verdict";
+
+/// The spec of one decision circuit (`zerolm_wsp::circuits::decide`).
+pub fn decide_spec(cfg: &ReasonerConfig, id: &str) -> Spec {
+    let p = params(cfg);
+    let circuit = match id {
+        JOIN_ID => Circuit::RelationJoin(p),
+        LEVELS_ID => Circuit::RelationLevels(p),
+        RULES_ID => Circuit::RelationRules(p),
+        COUNTS_ID => Circuit::RelationCounts(CountParams { relational: p, range: cfg.number_range as u32 }),
+        VERDICT_ID => Circuit::RelationVerdict(p),
+        other => panic!("no decision circuit {other}"),
+    };
+    Spec { id: id.into(), version: 1, seed_entry: "relation-decide-circuits".into(), description: String::new(), circuit }
 }
 
 pub const ATOM_ID: &str = "atom-encode";
@@ -205,6 +226,11 @@ pub struct Circuits {
     pub reach: Compiled,
     pub probe: Compiled,
     pub cleanup: Compiled,
+    pub join: Compiled,
+    pub levels: Compiled,
+    pub rules: Compiled,
+    pub counts: Compiled,
+    pub verdict: Compiled,
 }
 
 impl Circuits {
@@ -214,7 +240,17 @@ impl Circuits {
             reach: compile(&reach_spec(cfg)).expect("valid reasoning config compiles"),
             probe: compile(&probe_spec(cfg)).expect("valid reasoning config compiles"),
             cleanup: compile(&cleanup_spec(cfg)).expect("valid reasoning config compiles"),
+            join: compile(&decide_spec(cfg, JOIN_ID)).expect("valid reasoning config compiles"),
+            levels: compile(&decide_spec(cfg, LEVELS_ID)).expect("valid reasoning config compiles"),
+            rules: compile(&decide_spec(cfg, RULES_ID)).expect("valid reasoning config compiles"),
+            counts: compile(&decide_spec(cfg, COUNTS_ID)).expect("valid reasoning config compiles"),
+            verdict: compile(&decide_spec(cfg, VERDICT_ID)).expect("valid reasoning config compiles"),
         }
+    }
+
+    /// Every compiled program, in checkpoint order.
+    pub fn all(&self) -> [&Compiled; 9] {
+        [&self.graph, &self.reach, &self.probe, &self.cleanup, &self.join, &self.levels, &self.rules, &self.counts, &self.verdict]
     }
 }
 
@@ -227,9 +263,6 @@ pub struct Graph {
     pub pos: Buf,
     pub neg: Buf,
 }
-
-/// Reached symbols (codebook index) -> premise slots of the shortest proof.
-pub type Reach = BTreeMap<usize, Vec<usize>>;
 
 fn view(m: &zerolm_tensor::Matrix, rows: usize) -> View<'_> {
     View::new(rows, m.cols, &m.data[..rows * m.cols])
@@ -433,51 +466,97 @@ impl Reasoner {
         [o.class_inclusion, o.transitivity, o.attribute_inheritance, o.comparison, o.arithmetic, o.temporal_ordering, o.negation, o.conditionals]
     }
 
-    /// Run C6 from symbol `from` over positive `rel` edges for operator `op`
-    /// (a disabled operator's enable block is bound as zero: direct edges only).
-    pub(crate) fn run_reach(&self, from: usize, to: Option<usize>, rel: &Hv, op: &str) -> Option<Outputs> {
-        if self.n_slots == 0 || self.n_sym == 0 {
-            return None;
-        }
+    /// The program's compiled constants, with the enable constant of every
+    /// disabled operator bound as zero (evaluation ablations).
+    fn op_consts<'a>(&self, c: &'a Compiled, zero: &'a [f32; 1]) -> Vec<(&'a str, View<'a>)> {
+        let disabled: Vec<String> = OPERATORS.iter().zip(self.op_flags()).filter(|(_, on)| !on).map(|(op, _)| format!("enable_{op}")).collect();
+        c.tensors.iter().map(|t| (t.name.as_str(), if disabled.iter().any(|d| *d == t.name) { View::new(1, 1, zero) } else { t.view() })).collect()
+    }
+
+    /// Run a graph-reading circuit (C6 or a decision circuit) with the memory,
+    /// the C5 outputs, and `extra` model tensors bound. `pol` is the name C6
+    /// gives its polarity row; the decision circuits read `pos` and `neg`.
+    fn run_on_graph(&self, c: &Compiled, inputs: Vec<(&str, Buf)>, extra: Vec<(&str, View<'_>)>) -> Outputs {
         let g = self.graph();
         let roles = self.roles_tensor();
-        let opi = OPERATORS.iter().position(|o| *o == op).expect("known operator");
-        let mut sel = vec![0.0f32; OPERATORS.len()];
-        sel[opi] = 1.0;
-        let x = self.code(from);
-        let y = to.map(|t| self.code(t)).unwrap_or_else(|| x.clone());
-        let inputs = vec![("x", Buf::row(x.data)), ("y", Buf::row(y.data)), ("rel", Buf::row(rel.data.clone())), ("operator", Buf::row(sel))];
         let mut w: Vec<(&str, View<'_>)> = vec![
             ("slots", view(&self.slots, self.n_slots)),
             ("codebook", view(&self.codebook, self.n_sym)),
             ("roles", View::new(ROLES.len(), 2 * self.cfg.dim, &roles)),
             ("subj_sim", g.subj_sim.view()),
             ("obj_t", g.obj_t.view()),
-            ("pol", g.pos.view()),
         ];
-        let zero = [0.0f32];
-        let disabled: Vec<String> =
-            OPERATORS.iter().zip(self.op_flags()).filter(|(_, on)| !on).map(|(op, _)| format!("enable_{op}")).collect();
-        for t in &self.circuits.reach.tensors {
-            let off = disabled.iter().any(|d| *d == t.name);
-            w.push((t.name.as_str(), if off { View::new(1, 1, &zero) } else { t.view() }));
+        if c.id == REACH_ID {
+            w.push(("pol", g.pos.view()));
+        } else {
+            w.push(("pos", g.pos.view()));
+            w.push(("neg", g.neg.view()));
         }
-        Some(self.exec(&self.circuits.reach, inputs, &w))
+        w.extend(extra);
+        let zero = [0.0f32];
+        w.extend(self.op_consts(c, &zero));
+        self.exec(c, inputs, &w)
     }
 
-    /// Every symbol reachable from `from` with its proof premises.
-    pub(crate) fn reach(&self, from: usize, rel: &Hv, op: &str) -> Reach {
-        let Some(o) = self.run_reach(from, None, rel, op) else { return Reach::new() };
-        let reached = &o.get("reached").data;
-        let proofs = o.get("proofs");
-        let mut out = Reach::new();
-        for (j, &r) in reached.iter().enumerate() {
-            if r == 1.0 {
-                let row = &proofs.data[j * proofs.cols..(j + 1) * proofs.cols];
-                out.insert(j, row.iter().enumerate().filter(|(_, &v)| v > 0.0).map(|(s, _)| s).collect());
-            }
-        }
-        out
+    /// C6 from vector `x` towards `y` over positive `rel` edges for operator
+    /// `op` (a disabled operator keeps only direct edges). The caller has
+    /// checked that the memory and codebook are not empty.
+    pub(crate) fn run_reach(&self, x: &Hv, y: &Hv, rel: &Hv, op: &str) -> Outputs {
+        let opi = OPERATORS.iter().position(|o| *o == op).expect("known operator");
+        let mut sel = vec![0.0f32; OPERATORS.len()];
+        sel[opi] = 1.0;
+        let inputs = vec![("x", Buf::row(x.data.clone())), ("y", Buf::row(y.data.clone())), ("rel", Buf::row(rel.data.clone())), ("operator", Buf::row(sel))];
+        self.run_on_graph(&self.circuits.reach, inputs, Vec::new())
+    }
+
+    /// `relation-join`: a negative `rel` edge from x (plus `src`'s reached
+    /// nodes) to y (plus `tgt`'s), with `src`/`tgt` C6 outputs or `None`.
+    pub(crate) fn run_join(&self, x: &Hv, y: &Hv, rel: &Hv, src: Option<&Outputs>, tgt: Option<&Outputs>) -> Outputs {
+        let none = |_: ()| (Buf::zeros(1, self.n_sym), Buf::zeros(self.n_sym, self.n_slots));
+        let side = |o: Option<&Outputs>| o.map(|o| (o.get("reached").clone(), o.get("proofs").clone())).unwrap_or_else(|| none(()));
+        let ((sm, sp), (tm, tp)) = (side(src), side(tgt));
+        let inputs = vec![
+            ("x", Buf::row(x.data.clone())),
+            ("y", Buf::row(y.data.clone())),
+            ("rel", Buf::row(rel.data.clone())),
+            ("src_more", sm),
+            ("src_proofs", sp),
+            ("tgt_more", tm),
+            ("tgt_proofs", tp),
+        ];
+        self.run_on_graph(&self.circuits.join, inputs, Vec::new())
+    }
+
+    /// `relation-levels` ("can").
+    pub(crate) fn run_levels(&self, x: &Hv, v: &Hv, rel_can: &Hv, rel_isa: &Hv) -> Outputs {
+        let inputs = vec![("x", Buf::row(x.data.clone())), ("v", Buf::row(v.data.clone())), ("rel_can", Buf::row(rel_can.data.clone())), ("rel_isa", Buf::row(rel_isa.data.clone()))];
+        self.run_on_graph(&self.circuits.levels, inputs, Vec::new())
+    }
+
+    /// `relation-rules` (properties and conditionals).
+    pub(crate) fn run_rules(&self, x: &Hv, p: &Hv, rel_prop: &Hv, rel_implies: &Hv, something: &Hv) -> Outputs {
+        let inputs = vec![
+            ("x", Buf::row(x.data.clone())),
+            ("p", Buf::row(p.data.clone())),
+            ("rel_prop", Buf::row(rel_prop.data.clone())),
+            ("rel_implies", Buf::row(rel_implies.data.clone())),
+            ("something", Buf::row(something.data.clone())),
+        ];
+        self.run_on_graph(&self.circuits.rules, inputs, Vec::new())
+    }
+
+    /// `relation-counts` (arithmetic).
+    pub(crate) fn run_counts(&self, x: &Hv, rel_has: &Hv, rel_more: &Hv) -> Outputs {
+        let inputs = vec![("x", Buf::row(x.data.clone())), ("rel_has", Buf::row(rel_has.data.clone())), ("rel_more", Buf::row(rel_more.data.clone()))];
+        let book = &self.numbers().codebook;
+        self.run_on_graph(&self.circuits.counts, inputs, vec![("numbers", view(book, book.rows))])
+    }
+
+    /// `relation-verdict`: findings to a one-hot verdict and premises.
+    pub(crate) fn run_verdict(&self, pos_found: f32, pos_proof: &Buf, neg_found: f32, neg_proof: &Buf) -> Outputs {
+        let inputs = vec![("pos_found", Buf::scalar(pos_found)), ("neg_found", Buf::scalar(neg_found)), ("pos_proof", pos_proof.clone()), ("neg_proof", neg_proof.clone())];
+        let w = with_consts(&self.circuits.verdict, Vec::new());
+        self.exec(&self.circuits.verdict, inputs, &w)
     }
 }
 

@@ -101,6 +101,13 @@
       "derived_from_corpus": false
     },
     {
+      "id": "relation-decide-circuits",
+      "kind": "structural_prior",
+      "description": "Circuits relation-join, relation-levels, relation-rules, relation-counts, and relation-verdict (model/prog/relation-*.json): the eight operators' decisions as fixed-step recurrences over the C5 graph outputs: negative edges between source and target sets with the shortest proof, level-by-level inheritance with a latched first decision, backward chaining over in-scope rules, counts along 'more' chains by phasor binding and codebook cleanup (one distinct value or a contradiction), and the yes/no/contradiction/unknown combination of findings. Constants: per-operator enable scalars, proof-length scores, readout values -range..range, one-hot verdict selectors. No vocabulary or facts.",
+      "source": "crates/zerolm-wsp/src/circuits/decide.rs",
+      "derived_from_corpus": false
+    },
+    {
       "id": "number-decode-circuit",
       "kind": "structural_prior",
       "description": "Circuit number-decode (model/prog/number-decode.json): cleanup of a noisy number phasor as a neural ISA program: scores against core.reasoner.number_codebook, top-1, and readout of the integer value (constant column -range..range) and the clean codebook row. No vocabulary or facts.",

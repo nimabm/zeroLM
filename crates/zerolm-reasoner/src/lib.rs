@@ -20,7 +20,7 @@ pub mod oracle;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use zerolm_engine::binding::{bind, unbind, Hv};
+use zerolm_engine::binding::{bind, Hv};
 use zerolm_engine::semantic_state::{parse, Fact, Pred, Rule, SemanticState, Term, Utterance};
 use zerolm_memory::checkpoint::{self, CheckpointError, Tensor};
 use zerolm_tensor::sha256::Sha256;
@@ -400,11 +400,6 @@ impl Reasoner {
         self.symbol_cleanup(v, circuits::CleanupMode::Same)
     }
 
-    /// Nearest codebook entry with cosine >= cleanup_min (`symbol-cleanup`).
-    pub(crate) fn cleanup(&self, v: &Hv) -> Option<usize> {
-        self.symbol_cleanup(v, circuits::CleanupMode::Cleanup)
-    }
-
     /// Index of a name's symbol if it was ever stored.
     pub fn known(&self, name: &str) -> Option<usize> {
         self.find_symbol(&self.symbol(name))
@@ -423,18 +418,6 @@ impl Reasoner {
         self.codebook.data[i * c..(i + 1) * c].copy_from_slice(&v.data);
         self.n_sym += 1;
         Ok(i)
-    }
-
-    // ---- Probes ----
-
-    /// Slots matching every given role-filler pair (sim >= k - margin), by the
-    /// `relation-probe` circuit.
-    pub(crate) fn matches(&self, parts: &[(usize, Hv)]) -> Vec<usize> {
-        self.probe(parts, 0.0, !self.retrieval_ablated).hits
-    }
-
-    pub(crate) fn unbind_slot(&self, slot: usize, role: usize) -> Hv {
-        unbind(&Hv::from_data(self.cfg.dim, self.slots.row(slot)), &self.role(role))
     }
 
     // ---- Language interface ----
@@ -593,7 +576,7 @@ impl Reasoner {
             ),
         ];
         // Compiled circuit constants (W_PROG), frozen like the role phasors.
-        for c in [&fresh.atoms.circuit, &fresh.numbers.encoder, &fresh.numbers.decoder, &fresh.circuits.graph, &fresh.circuits.reach, &fresh.circuits.probe, &fresh.circuits.cleanup] {
+        for c in [&fresh.atoms.circuit, &fresh.numbers.encoder, &fresh.numbers.decoder].into_iter().chain(fresh.circuits.all()) {
             for p in &c.tensors {
                 t.push(Tensor::new(&c.qualified(&p.name), zerolm_wsp::compiler::GROUP, p.rows, p.cols, p.data.clone()));
             }

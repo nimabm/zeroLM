@@ -12,7 +12,7 @@ pub mod patch;
 pub use compiler::{compile, parse_spec, Circuit, Compiled, ProgTensor, Spec};
 
 /// Pinned circuit specifications shipped with the model, as (file name, JSON).
-pub const SPECS: [(&str, &str); 13] = [
+pub const SPECS: [(&str, &str); 18] = [
     ("memory-read.json", include_str!("../../../model/prog/memory-read.json")),
     ("memory-encode.json", include_str!("../../../model/prog/memory-encode.json")),
     ("relation-graph.json", include_str!("../../../model/prog/relation-graph.json")),
@@ -26,6 +26,11 @@ pub const SPECS: [(&str, &str); 13] = [
     ("fast-write.json", include_str!("../../../model/prog/fast-write.json")),
     ("relation-probe.json", include_str!("../../../model/prog/relation-probe.json")),
     ("symbol-cleanup.json", include_str!("../../../model/prog/symbol-cleanup.json")),
+    ("relation-join.json", include_str!("../../../model/prog/relation-join.json")),
+    ("relation-levels.json", include_str!("../../../model/prog/relation-levels.json")),
+    ("relation-rules.json", include_str!("../../../model/prog/relation-rules.json")),
+    ("relation-counts.json", include_str!("../../../model/prog/relation-counts.json")),
+    ("relation-verdict.json", include_str!("../../../model/prog/relation-verdict.json")),
 ];
 
 /// `model/prog/pinned.json`: circuit id -> SHA-256 of the compiled output.

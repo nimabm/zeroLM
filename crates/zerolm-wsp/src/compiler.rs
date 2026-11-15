@@ -41,6 +41,11 @@ pub enum Circuit {
     FastWrite(circuits::value_codec::FastParams),
     RelationProbe(circuits::probe::ProbeParams),
     SymbolCleanup(circuits::probe::CleanupParams),
+    RelationJoin(circuits::relational::Params),
+    RelationLevels(circuits::relational::Params),
+    RelationRules(circuits::relational::Params),
+    RelationCounts(circuits::decide::CountParams),
+    RelationVerdict(circuits::relational::Params),
     RelationGraph(circuits::relational::Params),
     RelationReach(circuits::relational::Params),
 }
@@ -135,6 +140,11 @@ pub fn compile(spec: &Spec) -> Result<Compiled, IsaError> {
         Circuit::FastWrite(p) => circuits::value_codec::compile_fast_write(&spec.id, p)?,
         Circuit::RelationProbe(p) => circuits::probe::compile_probe(&spec.id, p)?,
         Circuit::SymbolCleanup(p) => circuits::probe::compile_cleanup(&spec.id, p)?,
+        Circuit::RelationJoin(p) => circuits::decide::compile_join(&spec.id, p)?,
+        Circuit::RelationLevels(p) => circuits::decide::compile_levels(&spec.id, p)?,
+        Circuit::RelationRules(p) => circuits::decide::compile_rules(&spec.id, p)?,
+        Circuit::RelationCounts(p) => circuits::decide::compile_counts(&spec.id, p)?,
+        Circuit::RelationVerdict(p) => circuits::decide::compile_verdict(&spec.id, p)?,
         Circuit::RelationGraph(p) => circuits::relational::compile_graph(&spec.id, p)?,
         Circuit::RelationReach(p) => circuits::relational::compile_reach(&spec.id, p)?,
     };
